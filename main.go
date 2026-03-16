@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -10,9 +11,12 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
+
+const defaultTimeout = 30 * time.Second
 
 const (
 	exitOK      = 0
@@ -51,21 +55,31 @@ func green(s string) string  { return c("\033[32m", s) }
 func main() {
 	args := os.Args[1:]
 
-	// check --json flag
+	// parse global flags
 	jsonOut := false
+	timeout := defaultTimeout
 	filtered := args[:0]
-	for _, a := range args {
-		if a == "--json" {
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--json" {
 			jsonOut = true
+		} else if args[i] == "--timeout" && i+1 < len(args) {
+			if d, err := time.ParseDuration(args[i+1]); err == nil {
+				timeout = d
+			}
+			i++
 		} else {
-			filtered = append(filtered, a)
+			filtered = append(filtered, args[i])
 		}
 	}
 	args = filtered
+	_ = timeout // used by callGWS via context
 
 	if len(args) == 0 {
-		// gm — inbox with default count
 		os.Exit(cmdInbox(defaultMax, jsonOut))
+	}
+
+	if args[0] == "--usage" || args[0] == "usage" {
+		os.Exit(cmdUsage())
 	}
 
 	// gm <number>
@@ -121,7 +135,9 @@ Usage:
   gm reply <id> "message"     reply to thread
 
 Flags:
-  --json    machine-readable JSON output
+  --json              machine-readable JSON output
+  --timeout <dur>     gws call timeout (default 30s)
+  --usage             show usage stats (last 30 days)
 `)
 }
 
@@ -133,8 +149,9 @@ func die(msg string) {
 // --- gws interaction ---
 
 func callGWS(args ...string) ([]byte, error) {
-	cmd := exec.Command(gwsBin, args...)
-	// capture stderr separately to filter noise and detect real errors
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, gwsBin, args...)
 	var stderrBuf strings.Builder
 	cmd.Stderr = &stderrBuf
 	out, err := cmd.Output()
@@ -205,13 +222,29 @@ func listMessages(query string, maxResults int) ([]messageEntry, error) {
 		return nil, nil
 	}
 
+	// Parallel metadata fetches
+	type result struct {
+		idx   int
+		entry messageEntry
+		err   error
+	}
+	results := make([]result, len(resp.Messages))
+	var wg sync.WaitGroup
+	for i, m := range resp.Messages {
+		wg.Add(1)
+		go func(i int, id string) {
+			defer wg.Done()
+			entry, err := getMetadata(id)
+			results[i] = result{idx: i, entry: entry, err: err}
+		}(i, m.ID)
+	}
+	wg.Wait()
+
 	entries := make([]messageEntry, 0, len(resp.Messages))
-	for _, m := range resp.Messages {
-		entry, err := getMetadata(m.ID)
-		if err != nil {
-			continue // skip failed lookups
+	for _, r := range results {
+		if r.err == nil {
+			entries = append(entries, r.entry)
 		}
-		entries = append(entries, entry)
 	}
 	return entries, nil
 }
@@ -305,10 +338,13 @@ func formatDate(raw string) string {
 // --- commands ---
 
 func cmdInbox(count int, jsonOut bool) int {
+	start := time.Now()
 	entries, err := listMessages("", count)
 	if err != nil {
 		return exitGWS
 	}
+	ms := time.Since(start).Milliseconds()
+	logUsage("inbox", err == nil, ms, len(entries))
 	if jsonOut {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -320,12 +356,15 @@ func cmdInbox(count int, jsonOut bool) int {
 }
 
 func cmdSearch(query string, count int, jsonOut bool) int {
+	start := time.Now()
 	entries, err := listMessages(query, count)
 	if err != nil {
 		return exitGWS
 	}
+	ms := time.Since(start).Milliseconds()
+	logUsage("search", err == nil, ms, len(entries))
 	if len(entries) == 0 {
-		fmt.Fprintln(os.Stderr, "no results")
+		fmt.Fprintf(os.Stderr, "no results for %q (searched inbox). Try broader terms.\n", query)
 		return exitOK
 	}
 	if jsonOut {
@@ -334,7 +373,7 @@ func cmdSearch(query string, count int, jsonOut bool) int {
 		enc.Encode(entries)
 		return exitOK
 	}
-	printTable(entries)
+	printTableWithSnippets(entries)
 	return exitOK
 }
 
@@ -364,6 +403,34 @@ func printTable(entries []messageEntry) {
 			bold(pad(subj, subjTruncLen)),
 			dim(date),
 		)
+	}
+}
+
+func printTableWithSnippets(entries []messageEntry) {
+	if len(entries) == 0 {
+		fmt.Fprintln(os.Stderr, "no messages")
+		return
+	}
+
+	for _, e := range entries {
+		id := pad(e.ID, idLen)
+		from := trunc(formatFrom(e.From), fromTruncLen)
+		subj := trunc(e.Subject, subjTruncLen)
+		date := e.Date
+
+		fmt.Fprintf(os.Stdout, "  %s  %s  %s  %s\n",
+			cyan(id),
+			yellow(pad(from, fromTruncLen)),
+			bold(pad(subj, subjTruncLen)),
+			dim(date),
+		)
+		if e.Snippet != "" {
+			snip := html.UnescapeString(e.Snippet)
+			if len(snip) > 100 {
+				snip = snip[:100] + "..."
+			}
+			fmt.Fprintf(os.Stdout, "  %s  %s\n", strings.Repeat(" ", idLen), dim(snip))
+		}
 	}
 }
 
@@ -638,4 +705,80 @@ func cmdReply(id, body string, jsonOut bool) int {
 	json.Unmarshal(sendOut, &sendResp)
 	fmt.Fprintf(os.Stderr, "%s reply sent (id: %s)\n", green("OK"), sendResp.ID)
 	return exitOK
+}
+
+func cmdUsage() int {
+	home, _ := os.UserHomeDir()
+	f, err := os.Open(home + "/.gm/usage.jsonl")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "no usage data yet")
+		return exitOK
+	}
+	defer f.Close()
+
+	var total, ok int
+	var totalMs int64
+	cmds := map[string]int{}
+	cutoff := time.Now().AddDate(0, 0, -30)
+
+	scanner := json.NewDecoder(f)
+	for {
+		var entry map[string]interface{}
+		if err := scanner.Decode(&entry); err != nil {
+			break
+		}
+		ts, _ := time.Parse(time.RFC3339, fmt.Sprint(entry["ts"]))
+		if ts.Before(cutoff) {
+			continue
+		}
+		total++
+		if b, _ := entry["ok"].(bool); b {
+			ok++
+		}
+		if ms, _ := entry["ms"].(float64); ms > 0 {
+			totalMs += int64(ms)
+		}
+		if cmd, _ := entry["cmd"].(string); cmd != "" {
+			cmds[cmd]++
+		}
+	}
+
+	if total == 0 {
+		fmt.Fprintln(os.Stderr, "no usage in last 30 days")
+		return exitOK
+	}
+
+	fmt.Fprintf(os.Stdout, "gm usage (30 days)\n")
+	fmt.Fprintf(os.Stdout, "  calls: %d  success: %d/%d (%.0f%%)\n", total, ok, total, float64(ok)/float64(total)*100)
+	fmt.Fprintf(os.Stdout, "  avg latency: %dms\n", totalMs/int64(total))
+	fmt.Fprintf(os.Stdout, "  commands:")
+	for cmd, n := range cmds {
+		fmt.Fprintf(os.Stdout, "  %s=%d", cmd, n)
+	}
+	fmt.Fprintln(os.Stdout)
+	return exitOK
+}
+
+// --- telemetry (AX Principle #10) ---
+
+func logUsage(cmd string, ok bool, ms int64, resultCount int) {
+	defer func() { recover() }() // never break the tool
+	home, _ := os.UserHomeDir()
+	dir := home + "/.gm"
+	os.MkdirAll(dir, 0755)
+	f, err := os.OpenFile(dir+"/usage.jsonl", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	entry := map[string]interface{}{
+		"ts":      time.Now().Format(time.RFC3339),
+		"cmd":     cmd,
+		"ok":      ok,
+		"ms":      ms,
+		"results": resultCount,
+	}
+	line, _ := json.Marshal(entry)
+	f.Write(line)
+	f.WriteString("\n")
 }
