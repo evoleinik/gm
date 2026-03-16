@@ -579,14 +579,18 @@ func findParts(p payload, textPlain, textHTML *string) {
 }
 
 func decodeBase64URL(s string) string {
-	// Gmail API uses URL-safe base64 without padding
-	decoded, err := base64.URLEncoding.WithPadding(base64.NoPadding).DecodeString(s)
+	// Gmail API uses URL-safe base64 without padding — add padding for Go's decoder
+	s = strings.ReplaceAll(s, "-", "+")
+	s = strings.ReplaceAll(s, "_", "/")
+	switch len(s) % 4 {
+	case 2:
+		s += "=="
+	case 3:
+		s += "="
+	}
+	decoded, err := base64.StdEncoding.DecodeString(s)
 	if err != nil {
-		// try standard base64 as fallback
-		decoded, err = base64.StdEncoding.DecodeString(s)
-		if err != nil {
-			return "(decode error)"
-		}
+		return "(decode error: " + err.Error() + ")"
 	}
 	return string(decoded)
 }
