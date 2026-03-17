@@ -888,9 +888,12 @@ func buildBodies(bodyText, mdFile string) (plain, htmlContent string, err error)
 			return "", "", fmt.Errorf("read markdown: %w", err)
 		}
 
-		// Write to temp file for pandoc (stdin case)
-		tmpFile := mdFile
-		if mdFile == "-" {
+		// Normalize AI-generated markdown: ensure blank line before lists
+		mdBytes = []byte(normalizeMD(string(mdBytes)))
+
+		// Write to temp file for pandoc (always, since we may have modified content)
+		tmpFile := ""
+		if true {
 			f, _ := os.CreateTemp("", "gm-*.md")
 			f.Write(mdBytes)
 			f.Close()
@@ -919,6 +922,33 @@ func buildBodies(bodyText, mdFile string) (plain, htmlContent string, err error)
 		htmlContent = "<html><body><pre>" + html.EscapeString(bodyText) + "</pre></body></html>"
 	}
 	return
+}
+
+// normalizeMD fixes common AI-generated markdown issues before pandoc:
+// 1. Insert blank line before list items that follow a non-blank, non-list line
+// 2. Insert blank line before headings that follow a non-blank line
+func normalizeMD(s string) string {
+	lines := strings.Split(s, "\n")
+	var out []string
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if i > 0 {
+			prevTrimmed := strings.TrimSpace(lines[i-1])
+			isList := strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "* ") ||
+				(len(trimmed) > 2 && trimmed[0] >= '0' && trimmed[0] <= '9' && strings.Contains(trimmed[:3], "."))
+			isHeading := strings.HasPrefix(trimmed, "#")
+			prevIsBlank := prevTrimmed == ""
+			prevIsList := strings.HasPrefix(prevTrimmed, "- ") || strings.HasPrefix(prevTrimmed, "* ") ||
+				(len(prevTrimmed) > 2 && prevTrimmed[0] >= '0' && prevTrimmed[0] <= '9' && strings.Contains(prevTrimmed[:3], "."))
+
+			// Insert blank line before list/heading if previous line isn't blank/list
+			if (isList && !prevIsBlank && !prevIsList) || (isHeading && !prevIsBlank) {
+				out = append(out, "")
+			}
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
 }
 
 func buildMIME(to, subject, cc, bcc, inReplyTo, references, plain, htmlContent string, attachments []string) ([]byte, error) {
