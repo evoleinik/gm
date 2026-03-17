@@ -1,16 +1,30 @@
 # gm — Gmail CLI
 
-Convenient wrapper around `gws` for reading Gmail. Shells out to `gws` for OAuth/API, parses JSON responses in Go.
+Read, search, reply, and send formatted emails. Shells out to `gws` for OAuth/API, builds MIME in pure Go, uses pandoc for markdown rendering.
 
 ## Commands
 
 ```bash
-gm                          # inbox: latest 10 messages
-gm 5                        # inbox: latest N messages
-gm read <id>                # read full email body (base64 decoded, HTML stripped)
-gm search "query"           # search + display results
-gm search "query" -n 20     # search with custom limit
-gm reply <id> "message"     # reply to a thread
+gm                                # inbox: latest 10 messages
+gm 5                              # inbox: latest N messages
+gm read <id>                      # read full email (HTML stripped)
+gm search "query"                 # search + display results
+gm search "query" -n 20           # search with custom limit
+gm reply <id> "message"           # plain text reply (threaded)
+gm send <to> <subject> [opts]     # formatted email (see below)
+```
+
+### gm send options
+
+```bash
+--body "text"       # plain text body
+--md file.md        # markdown body (pandoc → styled HTML)
+--md -              # markdown from stdin
+--attach file       # attach file (repeatable)
+--cc addr           # CC recipients
+--bcc addr          # BCC (default: evgeny@airshelf.ai)
+--no-bcc            # disable default BCC
+--reply msgid       # thread onto existing message
 ```
 
 All commands support `--json` for machine-readable output.
@@ -24,7 +38,7 @@ cp gm ~/go/bin/gm
 
 ## Architecture
 
-Single `main.go`, stdlib only. Calls `gws gmail users messages {list,get,send}` and parses responses.
+Single `main.go`, stdlib only. Calls `gws gmail users messages {list,get,send}` and parses responses. MIME building (multipart, base64, attachments) is pure Go. Markdown → HTML via pandoc.
 
 ## Exit codes
 
@@ -34,5 +48,6 @@ Single `main.go`, stdlib only. Calls `gws gmail users messages {list,get,send}` 
 
 ## Dependencies
 
-- `gws` binary (at `/usr/local/bin/gws`) — handles OAuth, API calls
+- `gws` binary — handles OAuth, API calls
+- `pandoc` — only for `--md` flag
 - Go 1.24+
