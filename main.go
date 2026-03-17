@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"html"
+	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -113,6 +115,10 @@ func main() {
 			die("usage: gm reply <message-id> \"message body\"")
 		}
 		os.Exit(cmdReply(args[1], args[2], jsonOut))
+	case "send":
+		// gm send <to> <subject> [options]
+		// Options: --body "text", --md file.md, --attach file, --cc addr, --bcc addr, --reply msgid
+		os.Exit(cmdSend(args[1:], jsonOut))
 	case "help", "--help", "-h":
 		printUsage()
 		os.Exit(exitOK)
@@ -124,7 +130,7 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Fprintf(os.Stderr, `gm — Gmail reader (wraps gws)
+	fmt.Fprintf(os.Stderr, `gm — Gmail CLI (wraps gws)
 
 Usage:
   gm                          inbox (latest 10)
@@ -132,7 +138,23 @@ Usage:
   gm read <id>                read full email
   gm search "query"           search messages
   gm search "query" -n 20     search with limit
-  gm reply <id> "message"     reply to thread
+  gm reply <id> "message"     reply to thread (plain text)
+  gm send <to> <subject> [options]  send formatted email
+
+Send options:
+  --body "text"         plain text body
+  --md file.md          markdown body (rendered to HTML via pandoc)
+  --attach file         attach a file (repeatable)
+  --cc addr             CC recipients
+  --bcc addr            BCC recipients (default: evgeny@airshelf.ai)
+  --no-bcc              disable default BCC
+  --reply msgid         thread onto an existing message
+
+Examples:
+  gm send bob@x.com "Hello" --body "Hi Bob"
+  gm send bob@x.com "Report" --md report.md --attach data.csv
+  gm send bob@x.com "Re: Topic" --md reply.md --reply 19cfbc6564b511d2
+  echo "**hi**" | gm send bob@x.com "Hello" --md -
 
 Flags:
   --json              machine-readable JSON output
@@ -709,6 +731,254 @@ func cmdReply(id, body string, jsonOut bool) int {
 	json.Unmarshal(sendOut, &sendResp)
 	fmt.Fprintf(os.Stderr, "%s reply sent (id: %s)\n", green("OK"), sendResp.ID)
 	return exitOK
+}
+
+// --- send command (pure Go: MIME building + pandoc for markdown) ---
+
+const emailCSS = `body{font-family:-apple-system,system-ui,sans-serif;max-width:680px;margin:0 auto;padding:24px;color:#000;line-height:1.7;font-size:15px}h1{font-size:1.3em;font-weight:600;border-bottom:1px solid #e8e8e8;padding-bottom:6px}h2{font-size:1.1em;font-weight:600;margin-top:28px}h3{font-size:1em;color:#000}ul,ol{padding-left:24px}li{margin:4px 0}table{border-collapse:collapse;width:100%;font-size:14px}th,td{border:1px solid #e0e0e0;padding:6px 12px;text-align:left}th{background:#fafafa;font-weight:600}code{background:#f3f4f5;padding:1px 5px;border-radius:3px;font-size:.88em;color:#555}blockquote{border-left:3px solid #ddd;margin:8px 0;padding:2px 14px;color:#666}a{color:#4a7ccc;text-decoration:none}`
+
+func cmdSend(args []string, jsonOut bool) int {
+	if len(args) < 2 {
+		die("usage: gm send <to> <subject> [--body text | --md file] [--attach file] [--cc addr] [--bcc addr] [--no-bcc] [--reply msgid]")
+	}
+
+	to := args[0]
+	subject := args[1]
+	bodyText := ""
+	mdFile := ""
+	cc := ""
+	bcc := "evgeny@airshelf.ai"
+	replyMsgID := ""
+	var attachments []string
+
+	for i := 2; i < len(args); i++ {
+		switch args[i] {
+		case "--body":
+			i++; if i < len(args) { bodyText = args[i] }
+		case "--md":
+			i++; if i < len(args) { mdFile = args[i] }
+		case "--attach":
+			i++; if i < len(args) { attachments = append(attachments, args[i]) }
+		case "--cc":
+			i++; if i < len(args) { cc = args[i] }
+		case "--bcc":
+			i++; if i < len(args) { bcc = args[i] }
+		case "--no-bcc":
+			bcc = ""
+		case "--reply":
+			i++; if i < len(args) { replyMsgID = args[i] }
+		default:
+			fmt.Fprintf(os.Stderr, "unknown send option: %s\n", args[i])
+			return exitUser
+		}
+	}
+
+	if bodyText == "" && mdFile == "" {
+		die("gm send: need --body or --md")
+	}
+
+	// Resolve threading info
+	threadID := ""
+	inReplyTo := ""
+	references := ""
+	if replyMsgID != "" {
+		threadID, inReplyTo, references = resolveThread(replyMsgID)
+	}
+
+	// Get plain text and HTML body
+	plainBody, htmlBody, err := buildBodies(bodyText, mdFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "build body: %v\n", err)
+		return exitUser
+	}
+
+	// Build MIME message
+	raw, err := buildMIME(to, subject, cc, bcc, inReplyTo, references, plainBody, htmlBody, attachments)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "build MIME: %v\n", err)
+		return exitUser
+	}
+
+	// Send via gws
+	rawB64 := base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString(raw)
+
+	sendPayload := map[string]interface{}{"raw": rawB64}
+	if threadID != "" {
+		sendPayload["threadId"] = threadID
+	}
+	sendJSON, _ := json.Marshal(sendPayload)
+	sendParams, _ := json.Marshal(map[string]string{"userId": "me"})
+
+	out, err := callGWS("gmail", "users", "messages", "send",
+		"--params", string(sendParams),
+		"--json", string(sendJSON))
+	if err != nil {
+		return exitGWS
+	}
+
+	// Print result
+	if jsonOut {
+		os.Stdout.Write(out)
+		fmt.Println()
+		return exitOK
+	}
+
+	var resp struct{ ID string `json:"id"` }
+	json.Unmarshal(out, &resp)
+
+	summary := fmt.Sprintf("Sent to %s", to)
+	if cc != "" { summary += fmt.Sprintf(" (cc: %s)", cc) }
+	if bcc != "" { summary += fmt.Sprintf(" (bcc: %s)", bcc) }
+	if len(attachments) > 0 { summary += fmt.Sprintf(" [%d attachment(s)]", len(attachments)) }
+	if threadID != "" { summary += " [threaded]" }
+	fmt.Fprintf(os.Stderr, "%s %s: %s\n", green("OK"), summary, subject)
+	return exitOK
+}
+
+func resolveThread(msgID string) (threadID, inReplyTo, references string) {
+	params, _ := json.Marshal(map[string]interface{}{
+		"userId": "me", "id": msgID, "format": "metadata",
+	})
+	out, err := callGWS("gmail", "users", "messages", "get", "--params", string(params))
+	if err != nil {
+		return
+	}
+	var orig struct {
+		ThreadID string `json:"threadId"`
+		Payload  struct{ Headers []header `json:"headers"` } `json:"payload"`
+	}
+	if json.Unmarshal(out, &orig) != nil {
+		return
+	}
+	hdrs := extractHeaders(orig.Payload.Headers)
+	threadID = orig.ThreadID
+	inReplyTo = hdrs["Message-ID"]
+	if refs := hdrs["References"]; refs != "" {
+		references = refs + " " + inReplyTo
+	} else {
+		references = inReplyTo
+	}
+	return
+}
+
+func buildBodies(bodyText, mdFile string) (plain, htmlContent string, err error) {
+	if mdFile != "" {
+		// Read markdown source
+		var mdBytes []byte
+		if mdFile == "-" {
+			mdBytes, err = io.ReadAll(os.Stdin)
+		} else {
+			mdBytes, err = os.ReadFile(mdFile)
+		}
+		if err != nil {
+			return "", "", fmt.Errorf("read markdown: %w", err)
+		}
+
+		// Write to temp file for pandoc (stdin case)
+		tmpFile := mdFile
+		if mdFile == "-" {
+			f, _ := os.CreateTemp("", "gm-*.md")
+			f.Write(mdBytes)
+			f.Close()
+			tmpFile = f.Name()
+			defer os.Remove(tmpFile)
+		}
+
+		// pandoc → plain text
+		cmd := exec.Command("pandoc", tmpFile, "--to", "plain")
+		plainOut, err := cmd.Output()
+		if err != nil {
+			return "", "", fmt.Errorf("pandoc plain: %w", err)
+		}
+		plain = string(plainOut)
+
+		// pandoc → HTML with inline CSS
+		cmd = exec.Command("pandoc", tmpFile, "-f", "markdown", "-t", "html5", "--standalone",
+			"-V", "header-includes=<style>"+emailCSS+"</style>")
+		htmlOut, err := cmd.Output()
+		if err != nil {
+			return "", "", fmt.Errorf("pandoc html: %w", err)
+		}
+		htmlContent = string(htmlOut)
+	} else {
+		plain = bodyText
+		htmlContent = "<html><body><pre>" + html.EscapeString(bodyText) + "</pre></body></html>"
+	}
+	return
+}
+
+func buildMIME(to, subject, cc, bcc, inReplyTo, references, plain, htmlContent string, attachments []string) ([]byte, error) {
+	var buf strings.Builder
+	boundary := fmt.Sprintf("==%x==", time.Now().UnixNano())
+
+	// Headers
+	buf.WriteString("From: me\r\n")
+	buf.WriteString("To: " + to + "\r\n")
+	if cc != "" { buf.WriteString("Cc: " + cc + "\r\n") }
+	if bcc != "" { buf.WriteString("Bcc: " + bcc + "\r\n") }
+	buf.WriteString("Subject: " + subject + "\r\n")
+	if inReplyTo != "" { buf.WriteString("In-Reply-To: " + inReplyTo + "\r\n") }
+	if references != "" { buf.WriteString("References: " + references + "\r\n") }
+	buf.WriteString("MIME-Version: 1.0\r\n")
+
+	if len(attachments) > 0 {
+		mixedBoundary := boundary + "-mixed"
+		altBoundary := boundary + "-alt"
+
+		buf.WriteString("Content-Type: multipart/mixed; boundary=\"" + mixedBoundary + "\"\r\n\r\n")
+
+		// Body part (multipart/alternative)
+		buf.WriteString("--" + mixedBoundary + "\r\n")
+		buf.WriteString("Content-Type: multipart/alternative; boundary=\"" + altBoundary + "\"\r\n\r\n")
+		writeAlternativeParts(&buf, altBoundary, plain, htmlContent)
+
+		// Attachment parts
+		for _, path := range attachments {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return nil, fmt.Errorf("read attachment %s: %w", path, err)
+			}
+			filename := filepath.Base(path)
+			buf.WriteString("--" + mixedBoundary + "\r\n")
+			buf.WriteString("Content-Type: application/octet-stream; name=\"" + filename + "\"\r\n")
+			buf.WriteString("Content-Disposition: attachment; filename=\"" + filename + "\"\r\n")
+			buf.WriteString("Content-Transfer-Encoding: base64\r\n\r\n")
+			writeBase64(&buf, data)
+		}
+		buf.WriteString("--" + mixedBoundary + "--\r\n")
+	} else {
+		altBoundary := boundary + "-alt"
+		buf.WriteString("Content-Type: multipart/alternative; boundary=\"" + altBoundary + "\"\r\n\r\n")
+		writeAlternativeParts(&buf, altBoundary, plain, htmlContent)
+	}
+
+	return []byte(buf.String()), nil
+}
+
+func writeAlternativeParts(buf *strings.Builder, boundary, plain, htmlContent string) {
+	buf.WriteString("--" + boundary + "\r\n")
+	buf.WriteString("Content-Type: text/plain; charset=utf-8\r\n")
+	buf.WriteString("Content-Transfer-Encoding: base64\r\n\r\n")
+	writeBase64(buf, []byte(plain))
+
+	buf.WriteString("--" + boundary + "\r\n")
+	buf.WriteString("Content-Type: text/html; charset=utf-8\r\n")
+	buf.WriteString("Content-Transfer-Encoding: base64\r\n\r\n")
+	writeBase64(buf, []byte(htmlContent))
+
+	buf.WriteString("--" + boundary + "--\r\n")
+}
+
+func writeBase64(buf *strings.Builder, data []byte) {
+	encoded := base64.StdEncoding.EncodeToString(data)
+	// Wrap at 76 chars per RFC 2045
+	for i := 0; i < len(encoded); i += 76 {
+		end := i + 76
+		if end > len(encoded) {
+			end = len(encoded)
+		}
+		buf.WriteString(encoded[i:end] + "\r\n")
+	}
 }
 
 func cmdUsage() int {
