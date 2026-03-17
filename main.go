@@ -18,7 +18,7 @@ import (
 	"unicode/utf8"
 )
 
-const defaultTimeout = 30 * time.Second
+var gTimeout = 30 * time.Second
 
 const (
 	exitOK      = 0
@@ -59,14 +59,13 @@ func main() {
 
 	// parse global flags
 	jsonOut := false
-	timeout := defaultTimeout
 	filtered := args[:0]
 	for i := 0; i < len(args); i++ {
 		if args[i] == "--json" {
 			jsonOut = true
 		} else if args[i] == "--timeout" && i+1 < len(args) {
 			if d, err := time.ParseDuration(args[i+1]); err == nil {
-				timeout = d
+				gTimeout = d
 			}
 			i++
 		} else {
@@ -74,7 +73,6 @@ func main() {
 		}
 	}
 	args = filtered
-	_ = timeout // used by callGWS via context
 
 	if len(args) == 0 {
 		os.Exit(cmdInbox(defaultMax, jsonOut))
@@ -171,7 +169,7 @@ func die(msg string) {
 // --- gws interaction ---
 
 func callGWS(args ...string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), gTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, gwsBin, args...)
 	var stderrBuf strings.Builder
@@ -481,6 +479,7 @@ func pad(s string, width int) string {
 // --- read command ---
 
 func cmdRead(id string, jsonOut bool) int {
+	start := time.Now()
 	params := map[string]interface{}{
 		"userId": "me",
 		"id":     id,
@@ -489,6 +488,7 @@ func cmdRead(id string, jsonOut bool) int {
 	pJSON, _ := json.Marshal(params)
 
 	out, err := callGWS("gmail", "users", "messages", "get", "--params", string(pJSON))
+	logUsage("read", err == nil, time.Since(start).Milliseconds(), 1)
 	if err != nil {
 		return exitGWS
 	}
@@ -645,6 +645,7 @@ func stripHTML(s string) string {
 // --- reply command ---
 
 func cmdReply(id, body string, jsonOut bool) int {
+	start := time.Now()
 	// first get the original message metadata to build reply headers
 	params := map[string]interface{}{
 		"userId": "me",
@@ -715,6 +716,7 @@ func cmdReply(id, body string, jsonOut bool) int {
 	sendOut, err := callGWS("gmail", "users", "messages", "send",
 		"--params", string(sendParamsJSON),
 		"--json", string(sendBody))
+	logUsage("reply", err == nil, time.Since(start).Milliseconds(), 1)
 	if err != nil {
 		return exitGWS
 	}
@@ -800,6 +802,7 @@ func cmdSend(args []string, jsonOut bool) int {
 	}
 
 	// Send via gws
+	start := time.Now()
 	rawB64 := base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString(raw)
 
 	sendPayload := map[string]interface{}{"raw": rawB64}
@@ -812,19 +815,30 @@ func cmdSend(args []string, jsonOut bool) int {
 	out, err := callGWS("gmail", "users", "messages", "send",
 		"--params", string(sendParams),
 		"--json", string(sendJSON))
+
+	ms := time.Since(start).Milliseconds()
+	logUsage("send", err == nil, ms, len(attachments))
+
 	if err != nil {
 		return exitGWS
 	}
 
 	// Print result
-	if jsonOut {
-		os.Stdout.Write(out)
-		fmt.Println()
-		return exitOK
-	}
-
 	var resp struct{ ID string `json:"id"` }
 	json.Unmarshal(out, &resp)
+
+	if jsonOut {
+		result := map[string]interface{}{
+			"id":          resp.ID,
+			"to":          to,
+			"subject":     subject,
+			"threaded":    threadID != "",
+			"attachments": len(attachments),
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.Encode(result)
+		return exitOK
+	}
 
 	summary := fmt.Sprintf("Sent to %s", to)
 	if cc != "" { summary += fmt.Sprintf(" (cc: %s)", cc) }
