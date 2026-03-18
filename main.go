@@ -460,6 +460,22 @@ func formatFrom(raw string) string {
 	return raw
 }
 
+func encodeSubject(s string) string {
+	// If ASCII-only, return as-is
+	isASCII := true
+	for i := 0; i < len(s); i++ {
+		if s[i] > 127 {
+			isASCII = false
+			break
+		}
+	}
+	if isASCII {
+		return s
+	}
+	// RFC 2047 encoded-word: =?charset?encoding?encoded-text?=
+	return "=?UTF-8?B?" + base64.StdEncoding.EncodeToString([]byte(s)) + "?="
+}
+
 func trunc(s string, max int) string {
 	if utf8.RuneCountInString(s) <= max {
 		return s
@@ -960,7 +976,7 @@ func buildMIME(to, subject, cc, bcc, inReplyTo, references, plain, htmlContent s
 	buf.WriteString("To: " + to + "\r\n")
 	if cc != "" { buf.WriteString("Cc: " + cc + "\r\n") }
 	if bcc != "" { buf.WriteString("Bcc: " + bcc + "\r\n") }
-	buf.WriteString("Subject: " + subject + "\r\n")
+	buf.WriteString("Subject: " + encodeSubject(subject) + "\r\n")
 	if inReplyTo != "" { buf.WriteString("In-Reply-To: " + inReplyTo + "\r\n") }
 	if references != "" { buf.WriteString("References: " + references + "\r\n") }
 	buf.WriteString("MIME-Version: 1.0\r\n")
