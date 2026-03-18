@@ -137,7 +137,9 @@ Usage:
   gm search "query"           search messages
   gm search "query" -n 20     search with limit
   gm reply <id> "message"     reply to thread (plain text)
-  gm send <to> <subject> [options]  send formatted email
+  gm send <to> <subject> [options]  draft email (review in Gmail, then send)
+  gm send --draft <id>             send a saved draft
+  gm send <to> <subject> --now     send immediately (skip draft)
 
 Send options:
   --body "text"         plain text body
@@ -756,8 +758,13 @@ func cmdReply(id, body string, jsonOut bool) int {
 const emailCSS = `body{font-family:-apple-system,system-ui,sans-serif;max-width:680px;margin:0 auto;padding:24px;color:#000;line-height:1.7;font-size:15px}h1{font-size:1.3em;font-weight:600;border-bottom:1px solid #e8e8e8;padding-bottom:6px}h2{font-size:1.1em;font-weight:600;margin-top:28px}h3{font-size:1em;color:#000}ul,ol{padding-left:24px}li{margin:4px 0}table{border-collapse:collapse;width:100%;font-size:14px}th,td{border:1px solid #e0e0e0;padding:6px 12px;text-align:left}th{background:#fafafa;font-weight:600}code{background:#f3f4f5;padding:1px 5px;border-radius:3px;font-size:.88em;color:#555}blockquote{border-left:3px solid #ddd;margin:8px 0;padding:2px 14px;color:#666}a{color:#4a7ccc;text-decoration:none}`
 
 func cmdSend(args []string, jsonOut bool) int {
+	// gm send --draft <id>  →  send an existing draft
+	if len(args) >= 2 && args[0] == "--draft" {
+		return cmdSendDraft(args[1], jsonOut)
+	}
+
 	if len(args) < 2 {
-		die("usage: gm send <to> <subject> [--body text | --md file] [--attach file] [--cc addr] [--bcc addr] [--no-bcc] [--reply msgid]")
+		die("usage: gm send <to> <subject> [--body text | --md file] [--attach file] [--cc addr] [--bcc addr] [--no-bcc] [--reply msgid] [--now]")
 	}
 
 	to := args[0]
@@ -767,6 +774,7 @@ func cmdSend(args []string, jsonOut bool) int {
 	cc := ""
 	bcc := "evgeny@airshelf.ai"
 	replyMsgID := ""
+	sendNow := false
 	var attachments []string
 
 	for i := 2; i < len(args); i++ {
@@ -785,6 +793,8 @@ func cmdSend(args []string, jsonOut bool) int {
 			bcc = ""
 		case "--reply":
 			i++; if i < len(args) { replyMsgID = args[i] }
+		case "--now":
+			sendNow = true
 		default:
 			fmt.Fprintf(os.Stderr, "unknown send option: %s\n", args[i])
 			return exitUser
@@ -817,9 +827,75 @@ func cmdSend(args []string, jsonOut bool) int {
 		return exitUser
 	}
 
-	// Send via gws
-	start := time.Now()
 	rawB64 := base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString(raw)
+
+	if sendNow {
+		return doSend(rawB64, threadID, to, cc, bcc, subject, attachments, jsonOut)
+	}
+	return doDraft(rawB64, threadID, to, cc, bcc, subject, attachments, jsonOut)
+}
+
+func doDraft(rawB64, threadID, to, cc, bcc, subject string, attachments []string, jsonOut bool) int {
+	start := time.Now()
+
+	draftPayload := map[string]interface{}{
+		"message": map[string]interface{}{"raw": rawB64},
+	}
+	if threadID != "" {
+		draftPayload["message"].(map[string]interface{})["threadId"] = threadID
+	}
+	draftJSON, _ := json.Marshal(draftPayload)
+	draftParams, _ := json.Marshal(map[string]string{"userId": "me"})
+
+	out, err := callGWS("gmail", "users", "drafts", "create",
+		"--params", string(draftParams),
+		"--json", string(draftJSON))
+
+	ms := time.Since(start).Milliseconds()
+	logUsage("draft", err == nil, ms, len(attachments))
+
+	if err != nil {
+		return exitGWS
+	}
+
+	var resp struct {
+		ID      string `json:"id"`
+		Message struct {
+			ID       string `json:"id"`
+			ThreadID string `json:"threadId"`
+		} `json:"message"`
+	}
+	json.Unmarshal(out, &resp)
+
+	gmailURL := "https://mail.google.com/mail/u/0/#drafts?compose=" + resp.Message.ID
+
+	if jsonOut {
+		result := map[string]interface{}{
+			"draft_id":    resp.ID,
+			"message_id":  resp.Message.ID,
+			"to":          to,
+			"subject":     subject,
+			"url":         gmailURL,
+			"attachments": len(attachments),
+			"action":      "drafted",
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.Encode(result)
+		return exitOK
+	}
+
+	summary := fmt.Sprintf("Draft saved for %s", to)
+	if cc != "" { summary += fmt.Sprintf(" (cc: %s)", cc) }
+	if bcc != "" { summary += fmt.Sprintf(" (bcc: %s)", bcc) }
+	if len(attachments) > 0 { summary += fmt.Sprintf(" [%d attachment(s)]", len(attachments)) }
+	fmt.Fprintf(os.Stderr, "%s %s: %s\n", yellow("DRAFT"), summary, subject)
+	fmt.Fprintf(os.Stderr, "  Review: %s\n", gmailURL)
+	fmt.Fprintf(os.Stderr, "  Send:   gm send --draft %s\n", resp.ID)
+	return exitOK
+}
+
+func doSend(rawB64, threadID, to, cc, bcc, subject string, attachments []string, jsonOut bool) int {
+	start := time.Now()
 
 	sendPayload := map[string]interface{}{"raw": rawB64}
 	if threadID != "" {
@@ -839,7 +915,6 @@ func cmdSend(args []string, jsonOut bool) int {
 		return exitGWS
 	}
 
-	// Print result
 	var resp struct{ ID string `json:"id"` }
 	json.Unmarshal(out, &resp)
 
@@ -850,6 +925,7 @@ func cmdSend(args []string, jsonOut bool) int {
 			"subject":     subject,
 			"threaded":    threadID != "",
 			"attachments": len(attachments),
+			"action":      "sent",
 		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.Encode(result)
@@ -862,6 +938,45 @@ func cmdSend(args []string, jsonOut bool) int {
 	if len(attachments) > 0 { summary += fmt.Sprintf(" [%d attachment(s)]", len(attachments)) }
 	if threadID != "" { summary += " [threaded]" }
 	fmt.Fprintf(os.Stderr, "%s %s: %s\n", green("OK"), summary, subject)
+	return exitOK
+}
+
+func cmdSendDraft(draftID string, jsonOut bool) int {
+	start := time.Now()
+
+	sendParams, _ := json.Marshal(map[string]string{"userId": "me"})
+	sendJSON, _ := json.Marshal(map[string]interface{}{
+		"id": draftID,
+	})
+
+	out, err := callGWS("gmail", "users", "drafts", "send",
+		"--params", string(sendParams),
+		"--json", string(sendJSON))
+
+	ms := time.Since(start).Milliseconds()
+	logUsage("send-draft", err == nil, ms, 0)
+
+	if err != nil {
+		return exitGWS
+	}
+
+	var resp struct {
+		ID       string `json:"id"`
+		ThreadID string `json:"threadId"`
+	}
+	json.Unmarshal(out, &resp)
+
+	if jsonOut {
+		result := map[string]interface{}{
+			"id":     resp.ID,
+			"action": "sent",
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.Encode(result)
+		return exitOK
+	}
+
+	fmt.Fprintf(os.Stderr, "%s Draft sent (id: %s)\n", green("OK"), resp.ID)
 	return exitOK
 }
 
