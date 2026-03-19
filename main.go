@@ -1058,6 +1058,8 @@ func buildBodies(bodyText, mdFile string) (plain, htmlContent string, err error)
 // normalizeMD fixes common AI-generated markdown issues before pandoc:
 // 1. Insert blank line before list items that follow a non-blank, non-list line
 // 2. Insert blank line before headings that follow a non-blank line
+// 3. Insert blank line after standalone bold lines (**text**) followed by non-blank text
+//    (LLMs write "**Header**\nDescription" but pandoc merges them into one paragraph)
 func normalizeMD(s string) string {
 	lines := strings.Split(s, "\n")
 	var out []string
@@ -1074,6 +1076,13 @@ func normalizeMD(s string) string {
 
 			// Insert blank line before list/heading if previous line isn't blank/list
 			if (isList && !prevIsBlank && !prevIsList) || (isHeading && !prevIsBlank) {
+				out = append(out, "")
+			}
+
+			// Insert blank line after standalone bold line followed by non-blank text
+			// Catches: "**Bold header**\nDescription" and "**Bold** (extra) — stuff\nDescription"
+			if !prevIsBlank && trimmed != "" && !isHeading && !isList &&
+				strings.HasPrefix(prevTrimmed, "**") && !strings.HasPrefix(trimmed, "**") {
 				out = append(out, "")
 			}
 		}
