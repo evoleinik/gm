@@ -662,6 +662,7 @@ func saveAttachments(msgID string, atts []attachmentInfo, dir string) int {
 		fmt.Fprintln(os.Stderr, "no attachments")
 		return exitOK
 	}
+	seen := map[string]int{}
 	for _, a := range atts {
 		var data []byte
 		var err error
@@ -677,12 +678,20 @@ func saveAttachments(msgID string, atts []attachmentInfo, dir string) int {
 			fmt.Fprintf(os.Stderr, "  error %s: %v\n", a.Filename, err)
 			return exitGWS
 		}
-		path := filepath.Join(dir, a.Filename)
+		// Deduplicate filenames: image.png → image_2.png, image_3.png, ...
+		name := a.Filename
+		seen[name]++
+		if seen[name] > 1 {
+			ext := filepath.Ext(name)
+			base := strings.TrimSuffix(name, ext)
+			name = fmt.Sprintf("%s_%d%s", base, seen[name], ext)
+		}
+		path := filepath.Join(dir, name)
 		if err := os.WriteFile(path, data, 0644); err != nil {
 			fmt.Fprintf(os.Stderr, "  write %s: %v\n", path, err)
 			return exitUser
 		}
-		fmt.Fprintf(os.Stderr, "  %s %s (%s)\n", green("saved"), a.Filename, formatSize(len(data)))
+		fmt.Fprintf(os.Stderr, "  %s %s (%s)\n", green("saved"), name, formatSize(len(data)))
 	}
 	return exitOK
 }
