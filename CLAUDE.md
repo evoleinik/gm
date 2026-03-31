@@ -7,9 +7,12 @@ Read, search, reply, and send formatted emails. Shells out to `gws` for OAuth/AP
 ```bash
 gm                                # inbox: latest 10 messages
 gm 5                              # inbox: latest N messages
-gm read <id>                      # read full email (HTML stripped)
+gm read <id>                      # read full email (shows attachments)
+gm read <id> <id2> ...            # batch read (parallel fetch)
+gm read <id> --save [dir]         # read + save attachments to dir (default: .)
 gm search "query"                 # search + display results
 gm search "query" -n 20           # search with custom limit
+gm search "query" --full          # search with body preview (500 chars) + attachments
 gm reply <id> "message"           # plain text reply (threaded)
 gm send <to> <subject> [opts]     # formatted email (see below)
 ```

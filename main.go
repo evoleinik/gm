@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -90,24 +92,52 @@ func main() {
 	switch args[0] {
 	case "read":
 		if len(args) < 2 {
-			die("usage: gm read <message-id>")
+			die("usage: gm read <id> [id2 ...] [--save [dir]]")
 		}
-		os.Exit(cmdRead(args[1], jsonOut))
+		saveDir := ""
+		doSave := false
+		var ids []string
+		for i := 1; i < len(args); i++ {
+			if args[i] == "--save" {
+				doSave = true
+				if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+					saveDir = args[i+1]
+					i++
+				} else {
+					saveDir = "."
+				}
+			} else if !strings.HasPrefix(args[i], "-") {
+				ids = append(ids, args[i])
+			}
+		}
+		if len(ids) == 0 {
+			die("usage: gm read <id> [id2 ...] [--save [dir]]")
+		}
+		if len(ids) == 1 {
+			os.Exit(cmdRead(ids[0], doSave, saveDir, jsonOut))
+		}
+		os.Exit(cmdReadBatch(ids, doSave, saveDir, jsonOut))
 	case "search":
 		if len(args) < 2 {
-			die("usage: gm search \"query\" [-n count]")
+			die("usage: gm search \"query\" [-n count] [--full]")
 		}
 		query := args[1]
 		count := defaultMax
+		full := false
 		for i := 2; i < len(args); i++ {
-			if args[i] == "-n" && i+1 < len(args) {
-				if n, err := strconv.Atoi(args[i+1]); err == nil && n > 0 {
-					count = n
+			switch args[i] {
+			case "-n":
+				if i+1 < len(args) {
+					if n, err := strconv.Atoi(args[i+1]); err == nil && n > 0 {
+						count = n
+					}
+					i++
 				}
-				i++
+			case "--full":
+				full = true
 			}
 		}
-		os.Exit(cmdSearch(query, count, jsonOut))
+		os.Exit(cmdSearch(query, count, full, jsonOut))
 	case "reply":
 		if len(args) < 3 {
 			die("usage: gm reply <message-id> \"message body\"")
@@ -133,9 +163,11 @@ func printUsage() {
 Usage:
   gm                          inbox (latest 10)
   gm <N>                      inbox (latest N)
-  gm read <id>                read full email
+  gm read <id> [id2 ...]       read email(s) (parallel if multiple)
+  gm read <id> --save [dir]   read + save attachments to dir (default: .)
   gm search "query"           search messages
   gm search "query" -n 20     search with limit
+  gm search "query" --full    search with body preview + attachments
   gm reply <id> "message"     reply to thread (plain text)
   gm send <to> <subject> [options]  draft email (review in Gmail, then send)
   gm send --draft <id>             send a saved draft
@@ -173,17 +205,25 @@ func die(msg string) {
 func callGWS(args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), gTimeout)
 	defer cancel()
+	start := time.Now()
 	cmd := exec.CommandContext(ctx, gwsBin, args...)
 	var stderrBuf strings.Builder
 	cmd.Stderr = &stderrBuf
 	out, err := cmd.Output()
 	if err != nil {
+		elapsed := time.Since(start)
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			stderr := stderrBuf.String()
-			// filter out the noise line
 			stderr = filterStderr(stderr)
 			if strings.Contains(stderr, "401") || strings.Contains(strings.ToLower(stderr), "auth") || strings.Contains(strings.ToLower(stderr), "token") {
-				fmt.Fprintf(os.Stderr, "gws auth failed — run 'gws auth login' to re-authenticate\n")
+				fmt.Fprintf(os.Stderr, "gws auth failed — run 'gws auth login' to re-authenticate. Do not retry.\n")
+			} else if elapsed < 100*time.Millisecond {
+				// Instant failure = gws config/binary issue, not transient
+				fmt.Fprintf(os.Stderr, "gws failed instantly (exit %d) — likely config or credentials issue. Do not retry.\n", exitErr.ExitCode())
+				if stderr != "" {
+					fmt.Fprintf(os.Stderr, "  detail: %s\n", strings.TrimSpace(stderr))
+				}
+				fmt.Fprintf(os.Stderr, "  fix: gws auth login\n")
 			} else if stderr != "" {
 				fmt.Fprintf(os.Stderr, "gws error: %s\n", strings.TrimSpace(stderr))
 			} else {
@@ -192,7 +232,7 @@ func callGWS(args ...string) ([]byte, error) {
 			return nil, fmt.Errorf("gws exit %d", exitErr.ExitCode())
 		}
 		if _, ok := err.(*exec.Error); ok {
-			fmt.Fprintf(os.Stderr, "gws not installed — see https://github.com/nicholasgasior/gws\n")
+			fmt.Fprintf(os.Stderr, "gws not found — install: go install github.com/nicholasgasior/gws@latest\n")
 			return nil, err
 		}
 		return nil, err
@@ -215,7 +255,7 @@ func filterStderr(s string) string {
 	return strings.Join(lines, "\n")
 }
 
-func listMessages(query string, maxResults int) ([]messageEntry, error) {
+func listMessages(query string, maxResults int, full bool) ([]messageEntry, error) {
 	params := map[string]interface{}{
 		"userId":     "me",
 		"maxResults": maxResults,
@@ -244,7 +284,11 @@ func listMessages(query string, maxResults int) ([]messageEntry, error) {
 		return nil, nil
 	}
 
-	// Parallel metadata fetches
+	// Parallel fetches
+	fetchFn := getMetadata
+	if full {
+		fetchFn = getFullPreview
+	}
 	type result struct {
 		idx   int
 		entry messageEntry
@@ -256,7 +300,7 @@ func listMessages(query string, maxResults int) ([]messageEntry, error) {
 		wg.Add(1)
 		go func(i int, id string) {
 			defer wg.Done()
-			entry, err := getMetadata(id)
+			entry, err := fetchFn(id)
 			results[i] = result{idx: i, entry: entry, err: err}
 		}(i, m.ID)
 	}
@@ -272,14 +316,16 @@ func listMessages(query string, maxResults int) ([]messageEntry, error) {
 }
 
 type messageEntry struct {
-	ID       string `json:"id"`
-	From     string `json:"from"`
-	Subject  string `json:"subject"`
-	Date     string `json:"date"`
-	DateRaw  string `json:"date_raw"`
-	Snippet  string `json:"snippet"`
-	ThreadID string `json:"thread_id"`
-	To       string `json:"to"`
+	ID          string           `json:"id"`
+	From        string           `json:"from"`
+	Subject     string           `json:"subject"`
+	Date        string           `json:"date"`
+	DateRaw     string           `json:"date_raw"`
+	Snippet     string           `json:"snippet"`
+	ThreadID    string           `json:"thread_id"`
+	To          string           `json:"to"`
+	Body        string           `json:"body,omitempty"`
+	Attachments []attachmentInfo `json:"attachments,omitempty"`
 }
 
 func getMetadata(id string) (messageEntry, error) {
@@ -331,6 +377,46 @@ func getMetadata(id string) (messageEntry, error) {
 	return entry, nil
 }
 
+const previewLen = 500
+
+func getFullPreview(id string) (messageEntry, error) {
+	params := map[string]interface{}{
+		"userId": "me",
+		"id":     id,
+		"format": "full",
+	}
+	pJSON, _ := json.Marshal(params)
+
+	out, err := callGWS("gmail", "users", "messages", "get", "--params", string(pJSON))
+	if err != nil {
+		return messageEntry{}, err
+	}
+
+	var msg fullMessage
+	if err := json.Unmarshal(out, &msg); err != nil {
+		return messageEntry{}, err
+	}
+
+	headers := extractHeaders(msg.Payload.Headers)
+	body := extractBody(msg.Payload)
+	if utf8.RuneCountInString(body) > previewLen {
+		body = string([]rune(body)[:previewLen]) + "..."
+	}
+
+	entry := messageEntry{
+		ID:          msg.ID,
+		Snippet:     "", // not needed when we have body
+		Body:        body,
+		Attachments: findAttachments(msg.Payload),
+	}
+	entry.Subject = headers["Subject"]
+	entry.From = headers["From"]
+	entry.To = headers["To"]
+	entry.DateRaw = headers["Date"]
+	entry.Date = formatDate(headers["Date"])
+	return entry, nil
+}
+
 func formatDate(raw string) string {
 	// try common RFC 2822 formats
 	formats := []string{
@@ -361,7 +447,7 @@ func formatDate(raw string) string {
 
 func cmdInbox(count int, jsonOut bool) int {
 	start := time.Now()
-	entries, err := listMessages("", count)
+	entries, err := listMessages("", count, false)
 	if err != nil {
 		return exitGWS
 	}
@@ -377,14 +463,14 @@ func cmdInbox(count int, jsonOut bool) int {
 	return exitOK
 }
 
-func cmdSearch(query string, count int, jsonOut bool) int {
+func cmdSearch(query string, count int, full bool, jsonOut bool) int {
 	start := time.Now()
-	entries, err := listMessages(query, count)
+	entries, err := listMessages(query, count, full)
 	if err != nil {
 		return exitGWS
 	}
 	ms := time.Since(start).Milliseconds()
-	logUsage("search", err == nil, ms, len(entries))
+	logUsage("search", err == nil, ms, len(entries), query)
 	if len(entries) == 0 {
 		fmt.Fprintf(os.Stderr, "no results for %q (searched inbox). Try broader terms.\n", query)
 		return exitOK
@@ -434,6 +520,7 @@ func printTableWithSnippets(entries []messageEntry) {
 		return
 	}
 
+	indent := strings.Repeat(" ", idLen)
 	for _, e := range entries {
 		id := pad(e.ID, idLen)
 		from := trunc(formatFrom(e.From), fromTruncLen)
@@ -446,12 +533,21 @@ func printTableWithSnippets(entries []messageEntry) {
 			bold(pad(subj, subjTruncLen)),
 			dim(date),
 		)
-		if e.Snippet != "" {
+		if e.Body != "" {
+			// --full mode: show body preview (first 200 chars for tty)
+			preview := e.Body
+			if utf8.RuneCountInString(preview) > 200 {
+				preview = string([]rune(preview)[:200]) + "..."
+			}
+			for _, line := range strings.SplitN(strings.TrimSpace(preview), "\n", 4) {
+				fmt.Fprintf(os.Stdout, "  %s  %s\n", indent, dim(line))
+			}
+		} else if e.Snippet != "" {
 			snip := html.UnescapeString(e.Snippet)
 			if len(snip) > 100 {
 				snip = snip[:100] + "..."
 			}
-			fmt.Fprintf(os.Stdout, "  %s  %s\n", strings.Repeat(" ", idLen), dim(snip))
+			fmt.Fprintf(os.Stdout, "  %s  %s\n", indent, dim(snip))
 		}
 	}
 }
@@ -496,7 +592,7 @@ func pad(s string, width int) string {
 
 // --- read command ---
 
-func cmdRead(id string, jsonOut bool) int {
+func cmdRead(id string, doSave bool, saveDir string, jsonOut bool) int {
 	start := time.Now()
 	params := map[string]interface{}{
 		"userId": "me",
@@ -506,7 +602,7 @@ func cmdRead(id string, jsonOut bool) int {
 	pJSON, _ := json.Marshal(params)
 
 	out, err := callGWS("gmail", "users", "messages", "get", "--params", string(pJSON))
-	logUsage("read", err == nil, time.Since(start).Milliseconds(), 1)
+	logUsage("read", err == nil, time.Since(start).Milliseconds(), 1, id)
 	if err != nil {
 		return exitGWS
 	}
@@ -517,33 +613,195 @@ func cmdRead(id string, jsonOut bool) int {
 		return exitGWS
 	}
 
-	// extract headers
 	headers := extractHeaders(msg.Payload.Headers)
 	body := extractBody(msg.Payload)
+	atts := findAttachments(msg.Payload)
 
 	if jsonOut {
-		result := map[string]string{
-			"id":      msg.ID,
-			"from":    headers["From"],
-			"to":      headers["To"],
-			"date":    headers["Date"],
-			"subject": headers["Subject"],
-			"body":    body,
+		result := map[string]interface{}{
+			"id":          msg.ID,
+			"from":        headers["From"],
+			"to":          headers["To"],
+			"date":        headers["Date"],
+			"subject":     headers["Subject"],
+			"body":        body,
+			"attachments": atts,
 		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		enc.Encode(result)
+		if doSave {
+			return saveAttachments(msg.ID, atts, saveDir)
+		}
 		return exitOK
 	}
 
-	// print human-readable
 	fmt.Printf("%s %s\n", dim("From:"), headers["From"])
 	fmt.Printf("%s %s\n", dim("To:"), headers["To"])
 	fmt.Printf("%s %s\n", dim("Date:"), headers["Date"])
 	fmt.Printf("%s %s\n", dim("Subject:"), bold(headers["Subject"]))
+	if len(atts) > 0 {
+		fmt.Printf("%s", dim("Attach:"))
+		for _, a := range atts {
+			fmt.Printf(" %s", cyan(a.Filename))
+			fmt.Printf(" %s", dim("("+formatSize(a.Size)+")"))
+		}
+		fmt.Println()
+	}
 	fmt.Println()
 	fmt.Println(body)
 
+	if doSave {
+		return saveAttachments(msg.ID, atts, saveDir)
+	}
+	return exitOK
+}
+
+func saveAttachments(msgID string, atts []attachmentInfo, dir string) int {
+	if len(atts) == 0 {
+		fmt.Fprintln(os.Stderr, "no attachments")
+		return exitOK
+	}
+	for _, a := range atts {
+		var data []byte
+		var err error
+		if a.attachmentID != "" {
+			data, err = getAttachmentData(msgID, a.attachmentID)
+		} else if a.data != "" {
+			data, err = base64URLDecode(a.data)
+		} else {
+			fmt.Fprintf(os.Stderr, "  skip %s (no data)\n", a.Filename)
+			continue
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  error %s: %v\n", a.Filename, err)
+			return exitGWS
+		}
+		path := filepath.Join(dir, a.Filename)
+		if err := os.WriteFile(path, data, 0644); err != nil {
+			fmt.Fprintf(os.Stderr, "  write %s: %v\n", path, err)
+			return exitUser
+		}
+		fmt.Fprintf(os.Stderr, "  %s %s (%s)\n", green("saved"), a.Filename, formatSize(len(data)))
+	}
+	return exitOK
+}
+
+func cmdReadBatch(ids []string, doSave bool, saveDir string, jsonOut bool) int {
+	start := time.Now()
+
+	type readResult struct {
+		msg fullMessage
+		raw []byte
+		err error
+	}
+	results := make([]readResult, len(ids))
+	var wg sync.WaitGroup
+	for i, id := range ids {
+		wg.Add(1)
+		go func(i int, id string) {
+			defer wg.Done()
+			params := map[string]interface{}{
+				"userId": "me",
+				"id":     id,
+				"format": "full",
+			}
+			pJSON, _ := json.Marshal(params)
+			out, err := callGWS("gmail", "users", "messages", "get", "--params", string(pJSON))
+			if err != nil {
+				results[i] = readResult{err: err}
+				return
+			}
+			var msg fullMessage
+			if err := json.Unmarshal(out, &msg); err != nil {
+				results[i] = readResult{err: err}
+				return
+			}
+			results[i] = readResult{msg: msg}
+		}(i, id)
+	}
+	wg.Wait()
+
+	ms := time.Since(start).Milliseconds()
+	okCount := 0
+	for _, r := range results {
+		if r.err == nil {
+			okCount++
+		}
+	}
+	logUsage("read-batch", okCount == len(ids), ms, okCount)
+
+	if jsonOut {
+		out := make([]map[string]interface{}, 0, len(results))
+		for _, r := range results {
+			if r.err != nil {
+				continue
+			}
+			headers := extractHeaders(r.msg.Payload.Headers)
+			out = append(out, map[string]interface{}{
+				"id":          r.msg.ID,
+				"from":        headers["From"],
+				"to":          headers["To"],
+				"date":        headers["Date"],
+				"subject":     headers["Subject"],
+				"body":        extractBody(r.msg.Payload),
+				"attachments": findAttachments(r.msg.Payload),
+			})
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		enc.Encode(out)
+		if doSave {
+			for _, r := range results {
+				if r.err == nil {
+					if code := saveAttachments(r.msg.ID, findAttachments(r.msg.Payload), saveDir); code != exitOK {
+						return code
+					}
+				}
+			}
+		}
+		return exitOK
+	}
+
+	// Human-readable output with separator
+	sep := dim(strings.Repeat("─", 40))
+	for i, r := range results {
+		if r.err != nil {
+			fmt.Fprintf(os.Stderr, "error reading %s: %v\n", ids[i], r.err)
+			continue
+		}
+		if i > 0 {
+			fmt.Println()
+			fmt.Println(sep)
+			fmt.Println()
+		}
+		headers := extractHeaders(r.msg.Payload.Headers)
+		atts := findAttachments(r.msg.Payload)
+		fmt.Printf("%s %s\n", dim("From:"), headers["From"])
+		fmt.Printf("%s %s\n", dim("To:"), headers["To"])
+		fmt.Printf("%s %s\n", dim("Date:"), headers["Date"])
+		fmt.Printf("%s %s\n", dim("Subject:"), bold(headers["Subject"]))
+		if len(atts) > 0 {
+			fmt.Printf("%s", dim("Attach:"))
+			for _, a := range atts {
+				fmt.Printf(" %s", cyan(a.Filename))
+				fmt.Printf(" %s", dim("("+formatSize(a.Size)+")"))
+			}
+			fmt.Println()
+		}
+		fmt.Println()
+		fmt.Println(extractBody(r.msg.Payload))
+
+		if doSave {
+			if code := saveAttachments(r.msg.ID, atts, saveDir); code != exitOK {
+				return code
+			}
+		}
+	}
+
+	if okCount == 0 {
+		return exitGWS
+	}
 	return exitOK
 }
 
@@ -554,6 +812,7 @@ type fullMessage struct {
 
 type payload struct {
 	MimeType string    `json:"mimeType"`
+	Filename string    `json:"filename"`
 	Headers  []header  `json:"headers"`
 	Body     body      `json:"body"`
 	Parts    []payload `json:"parts"`
@@ -565,8 +824,9 @@ type header struct {
 }
 
 type body struct {
-	Size int    `json:"size"`
-	Data string `json:"data"`
+	Size         int    `json:"size"`
+	Data         string `json:"data"`
+	AttachmentID string `json:"attachmentId"`
 }
 
 func extractHeaders(headers []header) map[string]string {
@@ -615,6 +875,75 @@ func findParts(p payload, textPlain, textHTML *string) {
 	}
 	for _, part := range p.Parts {
 		findParts(part, textPlain, textHTML)
+	}
+}
+
+type attachmentInfo struct {
+	Filename     string `json:"filename"`
+	MimeType     string `json:"mimeType"`
+	Size         int    `json:"size"`
+	attachmentID string // internal, not exposed in JSON
+	data         string // base64url data for inline attachments
+}
+
+func findAttachments(p payload) []attachmentInfo {
+	atts := []attachmentInfo{} // empty slice, not nil — marshals as [] not null
+	walkAttachments(p, &atts)
+	return atts
+}
+
+func walkAttachments(p payload, atts *[]attachmentInfo) {
+	if p.Filename != "" {
+		*atts = append(*atts, attachmentInfo{
+			Filename:     p.Filename,
+			MimeType:     p.MimeType,
+			Size:         p.Body.Size,
+			attachmentID: p.Body.AttachmentID,
+			data:         p.Body.Data,
+		})
+	}
+	for _, part := range p.Parts {
+		walkAttachments(part, atts)
+	}
+}
+
+func getAttachmentData(msgID, attID string) ([]byte, error) {
+	params, _ := json.Marshal(map[string]interface{}{
+		"userId": "me", "messageId": msgID, "id": attID,
+	})
+	out, err := callGWS("gmail", "users", "messages", "attachments", "get", "--params", string(params))
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Data string `json:"data"`
+	}
+	if err := json.Unmarshal(out, &resp); err != nil {
+		return nil, err
+	}
+	return base64URLDecode(resp.Data)
+}
+
+func base64URLDecode(s string) ([]byte, error) {
+	s = strings.ReplaceAll(s, "-", "+")
+	s = strings.ReplaceAll(s, "_", "/")
+	switch len(s) % 4 {
+	case 2:
+		s += "=="
+	case 3:
+		s += "="
+	}
+	return base64.StdEncoding.DecodeString(s)
+}
+
+func formatSize(bytes int) string {
+	switch {
+	case bytes >= 1<<20:
+		return fmt.Sprintf("%.1fM", float64(bytes)/float64(1<<20))
+	case bytes >= 1<<10:
+		return fmt.Sprintf("%.0fK", float64(bytes)/float64(1<<10))
+	default:
+		return fmt.Sprintf("%dB", bytes)
 	}
 }
 
@@ -1174,52 +1503,99 @@ func cmdUsage() int {
 	}
 	defer f.Close()
 
-	var total, ok int
-	var totalMs int64
-	cmds := map[string]int{}
+	type usageEntry struct {
+		ts  time.Time
+		cmd string
+		ok  bool
+		ms  int64
+		arg string
+	}
+
+	var entries []usageEntry
 	cutoff := time.Now().AddDate(0, 0, -30)
 
 	scanner := json.NewDecoder(f)
 	for {
-		var entry map[string]interface{}
-		if err := scanner.Decode(&entry); err != nil {
+		var raw map[string]interface{}
+		if err := scanner.Decode(&raw); err != nil {
 			break
 		}
-		ts, _ := time.Parse(time.RFC3339, fmt.Sprint(entry["ts"]))
+		ts, _ := time.Parse(time.RFC3339, fmt.Sprint(raw["ts"]))
 		if ts.Before(cutoff) {
 			continue
 		}
-		total++
-		if b, _ := entry["ok"].(bool); b {
-			ok++
+		e := usageEntry{ts: ts}
+		e.cmd, _ = raw["cmd"].(string)
+		e.ok, _ = raw["ok"].(bool)
+		if ms, _ := raw["ms"].(float64); ms > 0 {
+			e.ms = int64(ms)
 		}
-		if ms, _ := entry["ms"].(float64); ms > 0 {
-			totalMs += int64(ms)
-		}
-		if cmd, _ := entry["cmd"].(string); cmd != "" {
-			cmds[cmd]++
-		}
+		e.arg, _ = raw["arg"].(string)
+		entries = append(entries, e)
 	}
 
-	if total == 0 {
+	if len(entries) == 0 {
 		fmt.Fprintln(os.Stderr, "no usage in last 30 days")
 		return exitOK
 	}
 
+	// Aggregates
+	var okCount int
+	var totalMs int64
+	cmds := map[string]int{}
+	errors := map[string]int{}
+	for _, e := range entries {
+		if e.ok {
+			okCount++
+		} else {
+			errors[e.cmd]++
+		}
+		totalMs += e.ms
+		cmds[e.cmd]++
+	}
+
 	fmt.Fprintf(os.Stdout, "gm usage (30 days)\n")
-	fmt.Fprintf(os.Stdout, "  calls: %d  success: %d/%d (%.0f%%)\n", total, ok, total, float64(ok)/float64(total)*100)
-	fmt.Fprintf(os.Stdout, "  avg latency: %dms\n", totalMs/int64(total))
+	fmt.Fprintf(os.Stdout, "  calls: %d  success: %d/%d (%.0f%%)\n",
+		len(entries), okCount, len(entries), float64(okCount)/float64(len(entries))*100)
+	fmt.Fprintf(os.Stdout, "  avg latency: %dms\n", totalMs/int64(len(entries)))
 	fmt.Fprintf(os.Stdout, "  commands:")
 	for cmd, n := range cmds {
 		fmt.Fprintf(os.Stdout, "  %s=%d", cmd, n)
 	}
 	fmt.Fprintln(os.Stdout)
+
+	// Error breakdown
+	if len(errors) > 0 {
+		fmt.Fprintf(os.Stdout, "  errors:")
+		for cmd, n := range errors {
+			fmt.Fprintf(os.Stdout, "  %s=%d", cmd, n)
+		}
+		fmt.Fprintln(os.Stdout)
+	}
+
+	// Retry detection: same cmd+arg within 10s
+	retries := map[string]int{}
+	for i := 1; i < len(entries); i++ {
+		prev, cur := entries[i-1], entries[i]
+		if cur.cmd == prev.cmd && cur.arg == prev.arg && cur.arg != "" &&
+			cur.ts.Sub(prev.ts) < 10*time.Second {
+			retries[cur.cmd]++
+		}
+	}
+	if len(retries) > 0 {
+		fmt.Fprintf(os.Stdout, "  retries (<10s, same arg):")
+		for cmd, n := range retries {
+			fmt.Fprintf(os.Stdout, "  %s=%d", cmd, n)
+		}
+		fmt.Fprintln(os.Stdout)
+	}
+
 	return exitOK
 }
 
 // --- telemetry (AX Principle #10) ---
 
-func logUsage(cmd string, ok bool, ms int64, resultCount int) {
+func logUsage(cmd string, ok bool, ms int64, resultCount int, args ...string) {
 	defer func() { recover() }() // never break the tool
 	home, _ := os.UserHomeDir()
 	dir := home + "/.gm"
@@ -1235,6 +1611,11 @@ func logUsage(cmd string, ok bool, ms int64, resultCount int) {
 		"ok":      ok,
 		"ms":      ms,
 		"results": resultCount,
+	}
+	// Log first arg as short hash (privacy-safe, enables retry detection)
+	if len(args) > 0 && args[0] != "" {
+		h := sha256.Sum256([]byte(args[0]))
+		entry["arg"] = hex.EncodeToString(h[:4]) // 8 hex chars — enough to detect repeats
 	}
 	line, _ := json.Marshal(entry)
 	f.Write(line)

@@ -51,8 +51,11 @@ gm --json       # machine-readable
 ### Read
 
 ```bash
-gm read <message-id>           # human-readable (HTML stripped)
-gm read <message-id> --json    # full metadata + body
+gm read <message-id>                  # human-readable (shows attachments)
+gm read <id1> <id2> <id3>             # batch read (parallel fetch)
+gm read <message-id> --json           # full metadata + body + attachments
+gm read <message-id> --save           # read + save attachments to current dir
+gm read <message-id> --save ~/dl      # save attachments to specific dir
 ```
 
 ### Search
@@ -61,6 +64,7 @@ gm read <message-id> --json    # full metadata + body
 gm search "query"              # Gmail search syntax
 gm search "from:bob" -n 5      # limit results
 gm search "has:attachment newer_than:7d"
+gm search "query" --full           # body preview (500 chars) + attachments
 ```
 
 ### Reply
