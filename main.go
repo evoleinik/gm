@@ -171,7 +171,7 @@ Usage:
   gm reply <id> "message"     reply to thread (plain text)
   gm send <to> <subject> [options]  draft email (review in Gmail, then send)
   gm send --draft <id>             send a saved draft
-  gm send <to> <subject> --now     send immediately (skip draft)
+  gm send --draft <id>             send a reviewed draft
 
 Send options:
   --body "text"         plain text body
@@ -1102,7 +1102,7 @@ func cmdSend(args []string, jsonOut bool) int {
 	}
 
 	if len(args) < 2 {
-		die("usage: gm send <to> <subject> [--body text | --md file] [--attach file] [--cc addr] [--bcc addr] [--no-bcc] [--reply msgid] [--now]")
+		die("usage: gm send <to> <subject> [--body text | --md file] [--attach file] [--cc addr] [--bcc addr] [--no-bcc] [--reply msgid]")
 	}
 
 	to := args[0]
@@ -1112,7 +1112,6 @@ func cmdSend(args []string, jsonOut bool) int {
 	cc := ""
 	bcc := "evgeny@airshelf.ai"
 	replyMsgID := ""
-	sendNow := false
 	var attachments []string
 
 	for i := 2; i < len(args); i++ {
@@ -1132,7 +1131,8 @@ func cmdSend(args []string, jsonOut bool) int {
 		case "--reply":
 			i++; if i < len(args) { replyMsgID = args[i] }
 		case "--now":
-			sendNow = true
+			fmt.Fprintln(os.Stderr, "--now is disabled. gm always saves as draft. Send from Gmail or: gm send --draft <id>")
+			return exitUser
 		default:
 			fmt.Fprintf(os.Stderr, "unknown send option: %s\n", args[i])
 			return exitUser
@@ -1167,9 +1167,6 @@ func cmdSend(args []string, jsonOut bool) int {
 
 	rawB64 := base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString(raw)
 
-	if sendNow {
-		return doSend(rawB64, threadID, to, cc, bcc, subject, attachments, jsonOut)
-	}
 	return doDraft(rawB64, threadID, to, cc, bcc, subject, attachments, jsonOut)
 }
 
@@ -1229,53 +1226,6 @@ func doDraft(rawB64, threadID, to, cc, bcc, subject string, attachments []string
 	fmt.Fprintf(os.Stderr, "%s %s: %s\n", yellow("DRAFT"), summary, subject)
 	fmt.Fprintf(os.Stderr, "  Review: %s\n", gmailURL)
 	fmt.Fprintf(os.Stderr, "  Send:   gm send --draft %s\n", resp.ID)
-	return exitOK
-}
-
-func doSend(rawB64, threadID, to, cc, bcc, subject string, attachments []string, jsonOut bool) int {
-	start := time.Now()
-
-	sendPayload := map[string]interface{}{"raw": rawB64}
-	if threadID != "" {
-		sendPayload["threadId"] = threadID
-	}
-	sendJSON, _ := json.Marshal(sendPayload)
-	sendParams, _ := json.Marshal(map[string]string{"userId": "me"})
-
-	out, err := callGWS("gmail", "users", "messages", "send",
-		"--params", string(sendParams),
-		"--json", string(sendJSON))
-
-	ms := time.Since(start).Milliseconds()
-	logUsage("send", err == nil, ms, len(attachments))
-
-	if err != nil {
-		return exitGWS
-	}
-
-	var resp struct{ ID string `json:"id"` }
-	json.Unmarshal(out, &resp)
-
-	if jsonOut {
-		result := map[string]interface{}{
-			"id":          resp.ID,
-			"to":          to,
-			"subject":     subject,
-			"threaded":    threadID != "",
-			"attachments": len(attachments),
-			"action":      "sent",
-		}
-		enc := json.NewEncoder(os.Stdout)
-		enc.Encode(result)
-		return exitOK
-	}
-
-	summary := fmt.Sprintf("Sent to %s", to)
-	if cc != "" { summary += fmt.Sprintf(" (cc: %s)", cc) }
-	if bcc != "" { summary += fmt.Sprintf(" (bcc: %s)", bcc) }
-	if len(attachments) > 0 { summary += fmt.Sprintf(" [%d attachment(s)]", len(attachments)) }
-	if threadID != "" { summary += " [threaded]" }
-	fmt.Fprintf(os.Stderr, "%s %s: %s\n", green("OK"), summary, subject)
 	return exitOK
 }
 
