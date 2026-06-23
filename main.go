@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -9,6 +10,11 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"mime"
+	"mime/multipart"
+	"net/http"
+	"net/textproto"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -232,9 +238,12 @@ func callGWS(args ...string) ([]byte, error) {
 			return nil, fmt.Errorf("gws exit %d", exitErr.ExitCode())
 		}
 		if _, ok := err.(*exec.Error); ok {
-			fmt.Fprintf(os.Stderr, "gws not found — install: go install github.com/nicholasgasior/gws@latest\n")
+			fmt.Fprintf(os.Stderr, "gws not found — install: npm i -g @googleworkspace/cli\n")
 			return nil, err
 		}
+		// Any other start/exec failure (e.g. E2BIG when an argument exceeds the
+		// kernel's per-arg limit) must not be silent — Rule of Repair.
+		fmt.Fprintf(os.Stderr, "gws call failed: %v\n", err)
 		return nil, err
 	}
 	return out, nil
@@ -1121,7 +1130,12 @@ func cmdSend(args []string, jsonOut bool) int {
 		case "--md":
 			i++; if i < len(args) { mdFile = args[i] }
 		case "--attach":
-			i++; if i < len(args) { attachments = append(attachments, args[i]) }
+			i++
+			if i >= len(args) || strings.HasPrefix(args[i], "--") {
+				fmt.Fprintf(os.Stderr, "gm send: --attach needs a file path\n  example: gm send to@x.com \"Subject\" --body \"hi\" --attach /path/to/file.pdf\n")
+				return exitUser
+			}
+			attachments = append(attachments, args[i])
 		case "--cc":
 			i++; if i < len(args) { cc = args[i] }
 		case "--bcc":
@@ -1134,13 +1148,21 @@ func cmdSend(args []string, jsonOut bool) int {
 			fmt.Fprintln(os.Stderr, "--now is disabled. gm always saves as draft. Send from Gmail or: gm send --draft <id>")
 			return exitUser
 		default:
-			fmt.Fprintf(os.Stderr, "unknown send option: %s\n", args[i])
+			fmt.Fprintf(os.Stderr, "gm send: unknown option %q\n  valid: --body --md --attach --cc --bcc --no-bcc --reply\n", args[i])
 			return exitUser
 		}
 	}
 
 	if bodyText == "" && mdFile == "" {
-		die("gm send: need --body or --md")
+		fmt.Fprintf(os.Stderr, "gm send: need a body — pass --body \"text\" or --md file.md\n  example: gm send to@x.com \"Subject\" --body \"Hello\"\n")
+		return exitUser
+	}
+
+	// Validate attachments up front so failures name the offending file (guide-on-failure).
+	attSpecs, err := validateAttachments(attachments)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return exitUser
 	}
 
 	// Resolve threading info
@@ -1159,40 +1181,91 @@ func cmdSend(args []string, jsonOut bool) int {
 	}
 
 	// Build MIME message
-	raw, err := buildMIME(to, subject, cc, bcc, inReplyTo, references, plainBody, htmlBody, attachments)
+	raw, err := buildMIME(to, subject, cc, bcc, inReplyTo, references, plainBody, htmlBody, attSpecs)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "build MIME: %v\n", err)
 		return exitUser
 	}
 
-	rawB64 := base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString(raw)
-
-	return doDraft(rawB64, threadID, to, cc, bcc, subject, attachments, jsonOut)
+	start := time.Now()
+	res, err := createDraft(raw, threadID)
+	logUsage("draft", err == nil, time.Since(start).Milliseconds(), len(attSpecs))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gm send: %v\n", err)
+		return exitGWS
+	}
+	return emitDraftResult(res, to, cc, bcc, subject, attSpecs, jsonOut)
 }
 
-func doDraft(rawB64, threadID, to, cc, bcc, subject string, attachments []string, jsonOut bool) int {
-	start := time.Now()
+// attachSpec is a validated attachment: path verified readable, content-type resolved.
+type attachSpec struct {
+	path        string
+	name        string
+	size        int64
+	contentType string
+}
 
-	draftPayload := map[string]interface{}{
-		"message": map[string]interface{}{"raw": rawB64},
+func validateAttachments(paths []string) ([]attachSpec, error) {
+	specs := make([]attachSpec, 0, len(paths))
+	for _, p := range paths {
+		fi, err := os.Stat(p)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil, fmt.Errorf("gm send: --attach file not found: %s\n  example: gm send to@x.com \"Subject\" --body \"hi\" --attach /absolute/path/to/file.pdf", p)
+			}
+			return nil, fmt.Errorf("gm send: --attach cannot read %s: %v", p, err)
+		}
+		if fi.IsDir() {
+			return nil, fmt.Errorf("gm send: --attach %s is a directory, not a file", p)
+		}
+		ct := mime.TypeByExtension(filepath.Ext(p))
+		if ct == "" {
+			ct = "application/octet-stream"
+		}
+		specs = append(specs, attachSpec{path: p, name: filepath.Base(p), size: fi.Size(), contentType: ct})
 	}
+	return specs, nil
+}
+
+// draftResult is the normalized outcome of either draft-create path.
+type draftResult struct {
+	DraftID   string
+	MessageID string
+	ThreadID  string
+	Via       string // "gws" (argv path) or "upload" (direct media-upload path)
+}
+
+// maxArgvBody is a safe ceiling for the single `--json` argument passed to gws.
+// Linux caps any one argv string at MAX_ARG_STRLEN (PAGE_SIZE*32 = 131072 bytes);
+// exceeding it makes exec fail with E2BIG. Larger messages (attachments) take the
+// direct media-upload path instead, which carries the body in an HTTP request.
+const maxArgvBody = 120000
+
+// createDraft picks the right transport based on payload size, then creates the draft.
+func createDraft(raw []byte, threadID string) (draftResult, error) {
+	rawB64 := base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString(raw)
+	msg := map[string]interface{}{"raw": rawB64}
 	if threadID != "" {
-		draftPayload["message"].(map[string]interface{})["threadId"] = threadID
+		msg["threadId"] = threadID
 	}
-	draftJSON, _ := json.Marshal(draftPayload)
-	draftParams, _ := json.Marshal(map[string]string{"userId": "me"})
+	draftJSON, _ := json.Marshal(map[string]interface{}{"message": msg})
 
+	if len(draftJSON) < maxArgvBody {
+		return createDraftViaGWS(draftJSON)
+	}
+	// Too large for an argv string — Gmail's media upload is the intended path.
+	return createDraftViaUpload(raw, threadID)
+}
+
+// createDraftViaGWS uses the gws CLI (reuses its auth, token refresh, keyring).
+func createDraftViaGWS(draftJSON []byte) (draftResult, error) {
+	draftParams, _ := json.Marshal(map[string]string{"userId": "me"})
 	out, err := callGWS("gmail", "users", "drafts", "create",
 		"--params", string(draftParams),
 		"--json", string(draftJSON))
-
-	ms := time.Since(start).Milliseconds()
-	logUsage("draft", err == nil, ms, len(attachments))
-
 	if err != nil {
-		return exitGWS
+		return draftResult{}, err // callGWS already wrote a diagnostic to stderr
 	}
-
 	var resp struct {
 		ID      string `json:"id"`
 		Message struct {
@@ -1201,17 +1274,92 @@ func doDraft(rawB64, threadID, to, cc, bcc, subject string, attachments []string
 		} `json:"message"`
 	}
 	json.Unmarshal(out, &resp)
+	return draftResult{DraftID: resp.ID, MessageID: resp.Message.ID, ThreadID: resp.Message.ThreadID, Via: "gws"}, nil
+}
 
-	gmailURL := "https://mail.google.com/mail/u/0/#drafts?compose=" + resp.Message.ID
+// createDraftViaUpload posts the RFC822 message directly to Gmail's multipart media
+// upload endpoint (no argv size limit, correct message/rfc822 media type). It reuses
+// gws's stored OAuth refresh token rather than introducing its own auth.
+func createDraftViaUpload(raw []byte, threadID string) (draftResult, error) {
+	creds, project, err := loadOAuthCreds()
+	if err != nil {
+		return draftResult{}, err
+	}
+	token, err := refreshAccessToken(creds)
+	if err != nil {
+		return draftResult{}, err
+	}
+
+	meta := map[string]interface{}{"message": map[string]interface{}{}}
+	if threadID != "" {
+		meta["message"].(map[string]interface{})["threadId"] = threadID
+	}
+	metaJSON, _ := json.Marshal(meta)
+
+	var body bytes.Buffer
+	boundary := fmt.Sprintf("gm_%x", time.Now().UnixNano())
+	mw := multipart.NewWriter(&body)
+	mw.SetBoundary(boundary)
+	// Part 1: draft metadata (application/json). Part 2: the message (message/rfc822).
+	metaPart, _ := mw.CreatePart(textproto.MIMEHeader{"Content-Type": {"application/json; charset=UTF-8"}})
+	metaPart.Write(metaJSON)
+	mediaPart, _ := mw.CreatePart(textproto.MIMEHeader{"Content-Type": {"message/rfc822"}})
+	mediaPart.Write(raw)
+	mw.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), gTimeout)
+	defer cancel()
+	endpoint := "https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=multipart"
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, &body)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "multipart/related; boundary="+boundary)
+	if project != "" {
+		// Gmail API enablement/quota is checked against this project, not the
+		// OAuth client's own project (which may have Gmail disabled by default).
+		req.Header.Set("x-goog-user-project", project)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return draftResult{}, fmt.Errorf("draft upload: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return draftResult{}, fmt.Errorf("draft upload HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+	var r struct {
+		ID      string `json:"id"`
+		Message struct {
+			ID       string `json:"id"`
+			ThreadID string `json:"threadId"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(respBody, &r); err != nil {
+		return draftResult{}, fmt.Errorf("draft upload: parse response: %w", err)
+	}
+	return draftResult{DraftID: r.ID, MessageID: r.Message.ID, ThreadID: r.Message.ThreadID, Via: "upload"}, nil
+}
+
+func emitDraftResult(res draftResult, to, cc, bcc, subject string, atts []attachSpec, jsonOut bool) int {
+	gmailURL := ""
+	if res.MessageID != "" {
+		gmailURL = "https://mail.google.com/mail/u/0/#drafts?compose=" + res.MessageID
+	}
 
 	if jsonOut {
+		attOut := make([]map[string]interface{}, 0, len(atts))
+		for _, a := range atts {
+			attOut = append(attOut, map[string]interface{}{"filename": a.name, "size": a.size})
+		}
 		result := map[string]interface{}{
-			"draft_id":    resp.ID,
-			"message_id":  resp.Message.ID,
+			"draftId":     res.DraftID,
+			"messageId":   res.MessageID,
+			"threadId":    res.ThreadID,
 			"to":          to,
 			"subject":     subject,
 			"url":         gmailURL,
-			"attachments": len(attachments),
+			"attachments": attOut,
+			"via":         res.Via,
 			"action":      "drafted",
 		}
 		enc := json.NewEncoder(os.Stdout)
@@ -1219,14 +1367,110 @@ func doDraft(rawB64, threadID, to, cc, bcc, subject string, attachments []string
 		return exitOK
 	}
 
-	summary := fmt.Sprintf("Draft saved for %s", to)
-	if cc != "" { summary += fmt.Sprintf(" (cc: %s)", cc) }
-	if bcc != "" { summary += fmt.Sprintf(" (bcc: %s)", bcc) }
-	if len(attachments) > 0 { summary += fmt.Sprintf(" [%d attachment(s)]", len(attachments)) }
-	fmt.Fprintf(os.Stderr, "%s %s: %s\n", yellow("DRAFT"), summary, subject)
-	fmt.Fprintf(os.Stderr, "  Review: %s\n", gmailURL)
-	fmt.Fprintf(os.Stderr, "  Send:   gm send --draft %s\n", resp.ID)
+	// stdout = data (chainable): the ids a caller needs to verify or send.
+	fmt.Fprintf(os.Stdout, "draft %s message %s\n", res.DraftID, res.MessageID)
+
+	// stderr = human hints.
+	summary := fmt.Sprintf("DRAFT saved for %s", to)
+	if cc != "" { summary += fmt.Sprintf(" cc:%s", cc) }
+	if bcc != "" { summary += fmt.Sprintf(" bcc:%s", bcc) }
+	if len(atts) > 0 {
+		names := make([]string, len(atts))
+		for i, a := range atts { names[i] = a.name }
+		summary += fmt.Sprintf(" [%s]", strings.Join(names, ", "))
+	}
+	fmt.Fprintf(os.Stderr, "%s: %s\n", yellow(summary), subject)
+	if gmailURL != "" {
+		fmt.Fprintf(os.Stderr, "  Review: %s\n", gmailURL)
+	}
+	fmt.Fprintf(os.Stderr, "  Send:   gm send --draft %s\n", res.DraftID)
 	return exitOK
+}
+
+// --- OAuth (reuse gws's stored refresh token; no new auth state) ---
+
+type oauthCreds struct {
+	ClientID     string `json:"client_id"`
+	ClientSecret string `json:"client_secret"`
+	RefreshToken string `json:"refresh_token"`
+}
+
+func gwsConfigDir() string {
+	if d := os.Getenv("GWS_CONFIG_DIR"); d != "" {
+		return d
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".config", "gws")
+}
+
+// loadOAuthCreds reads gws's plaintext credentials and the OAuth client's project_id
+// (used as the quota project for the Gmail API call).
+func loadOAuthCreds() (oauthCreds, string, error) {
+	dir := gwsConfigDir()
+	credPath := filepath.Join(dir, "credentials.json")
+	raw, err := os.ReadFile(credPath)
+	if err != nil {
+		return oauthCreds{}, "", fmt.Errorf("large attachment needs direct upload but could not read %s: %v — run 'gws auth login'", credPath, err)
+	}
+	var c oauthCreds
+	if err := json.Unmarshal(raw, &c); err != nil {
+		return oauthCreds{}, "", fmt.Errorf("parse %s: %w", credPath, err)
+	}
+	if c.RefreshToken == "" || c.ClientID == "" {
+		return oauthCreds{}, "", fmt.Errorf("incomplete OAuth credentials in %s — run 'gws auth login'", credPath)
+	}
+	return c, readProjectID(filepath.Join(dir, "client_secret.json")), nil
+}
+
+// readProjectID extracts project_id from an OAuth client_secret.json
+// ({"installed":{...}} or {"web":{...}}). Returns "" if unavailable.
+func readProjectID(path string) string {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var outer map[string]json.RawMessage
+	if json.Unmarshal(raw, &outer) != nil {
+		return ""
+	}
+	for _, v := range outer {
+		var inner struct {
+			ProjectID string `json:"project_id"`
+		}
+		if json.Unmarshal(v, &inner) == nil && inner.ProjectID != "" {
+			return inner.ProjectID
+		}
+	}
+	return ""
+}
+
+func refreshAccessToken(c oauthCreds) (string, error) {
+	form := url.Values{}
+	form.Set("client_id", c.ClientID)
+	form.Set("client_secret", c.ClientSecret)
+	form.Set("refresh_token", c.RefreshToken)
+	form.Set("grant_type", "refresh_token")
+
+	ctx, cancel := context.WithTimeout(context.Background(), gTimeout)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "https://oauth2.googleapis.com/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("oauth token refresh: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("oauth token refresh HTTP %d: %s — run 'gws auth login'", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var tr struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.Unmarshal(body, &tr); err != nil || tr.AccessToken == "" {
+		return "", fmt.Errorf("oauth token refresh: no access_token in response")
+	}
+	return tr.AccessToken, nil
 }
 
 func cmdSendDraft(draftID string, jsonOut bool) int {
@@ -1379,7 +1623,7 @@ func normalizeMD(s string) string {
 	return strings.Join(out, "\n")
 }
 
-func buildMIME(to, subject, cc, bcc, inReplyTo, references, plain, htmlContent string, attachments []string) ([]byte, error) {
+func buildMIME(to, subject, cc, bcc, inReplyTo, references, plain, htmlContent string, attachments []attachSpec) ([]byte, error) {
 	var buf strings.Builder
 	boundary := fmt.Sprintf("==%x==", time.Now().UnixNano())
 
@@ -1405,15 +1649,14 @@ func buildMIME(to, subject, cc, bcc, inReplyTo, references, plain, htmlContent s
 		writeAlternativeParts(&buf, altBoundary, plain, htmlContent)
 
 		// Attachment parts
-		for _, path := range attachments {
-			data, err := os.ReadFile(path)
+		for _, a := range attachments {
+			data, err := os.ReadFile(a.path)
 			if err != nil {
-				return nil, fmt.Errorf("read attachment %s: %w", path, err)
+				return nil, fmt.Errorf("read attachment %s: %w", a.path, err)
 			}
-			filename := filepath.Base(path)
 			buf.WriteString("--" + mixedBoundary + "\r\n")
-			buf.WriteString("Content-Type: application/octet-stream; name=\"" + filename + "\"\r\n")
-			buf.WriteString("Content-Disposition: attachment; filename=\"" + filename + "\"\r\n")
+			buf.WriteString("Content-Type: " + a.contentType + "; name=\"" + a.name + "\"\r\n")
+			buf.WriteString("Content-Disposition: attachment; filename=\"" + a.name + "\"\r\n")
 			buf.WriteString("Content-Transfer-Encoding: base64\r\n\r\n")
 			writeBase64(&buf, data)
 		}

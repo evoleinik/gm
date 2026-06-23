@@ -32,16 +32,21 @@ gm send <to> <subject> [opts]     # formatted email (see below)
 
 All commands support `--json` for machine-readable output.
 
+`gm send` always saves a DRAFT (never auto-sends). On success it prints the draft id
++ message id to stdout; `--json` emits `{"draftId","messageId","threadId","to","subject","url","attachments":[{"filename","size"}],"via","action"}`.
+
 ## Build
 
 ```bash
 go build -o gm .
-cp gm ~/go/bin/gm
+cp gm ~/bin/gm   # PATH location on box (also ~/go/bin works)
 ```
 
 ## Architecture
 
-Single `main.go`, stdlib only. Calls `gws gmail users messages {list,get,send}` and parses responses. MIME building (multipart, base64, attachments) is pure Go. Markdown → HTML via pandoc.
+Single `main.go`, stdlib only. Default path calls `gws gmail users messages/drafts {list,get,create,send}` and parses responses. MIME building (multipart, base64, attachments) is pure Go. Markdown → HTML via pandoc.
+
+**Large-attachment path (the `--attach` fix):** Gmail's draft body is passed to gws as a single `--json` argv string, but Linux caps one argv string at `MAX_ARG_STRLEN` (128 KB) — so a draft with a ~90 KB+ attachment makes `exec` fail with E2BIG (previously a silent exit 2). When the encoded body would exceed `maxArgvBody` (120 KB), `createDraft` escalates to `createDraftViaUpload`: it reads gws's plaintext `credentials.json` (`$GWS_CONFIG_DIR`, default `~/.config/gws/`), refreshes an access token, and POSTs the RFC822 message to `…/upload/gmail/v1/users/me/drafts?uploadType=multipart` as a `message/rfc822` media part. The OAuth client's own project has Gmail disabled by default, so the request sets `x-goog-user-project` to the `project_id` from `client_secret.json` (the quota project that has Gmail enabled). This path only works where credentials are plaintext (box, not the encrypted-cred machines). gws's own `--upload` is unusable here because it hardcodes `application/octet-stream`, which Gmail rejects for drafts.
 
 ## Exit codes
 

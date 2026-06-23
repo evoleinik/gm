@@ -98,6 +98,21 @@ gm send to@email "Subject" --body "Hi" --cc alice@x.com --bcc boss@x.com
 gm send to@email "Subject" --body "Hi" --no-bcc
 ```
 
+`gm send` always saves a **draft** (never auto-sends). On success it prints the
+draft id and message id to stdout so you can verify or chain (`gm send --draft <id>`
+to send). With `--json` it emits a structured object:
+
+```json
+{"draftId":"r-123","messageId":"19ef...","threadId":"19ef...","to":"bob@x.com",
+ "subject":"Report","url":"https://mail.google.com/...","attachments":[{"filename":"data.csv","size":2048}],
+ "via":"gws","action":"drafted"}
+```
+
+Attachments of any size work. Small messages go through `gws`; messages too large
+for a single command-line argument (Linux caps one argv string at 128 KB — a ~90 KB
+attachment is enough) are uploaded directly to Gmail's media endpoint, reusing gws's
+stored OAuth token. `via` reports which path was used.
+
 ## Exit Codes
 
 | Code | Meaning |
@@ -108,13 +123,21 @@ gm send to@email "Subject" --body "Hi" --no-bcc
 
 ## Architecture
 
-Single `main.go`, Go stdlib only (no dependencies). All Gmail API calls go through `gws`. MIME message building, base64 encoding, multipart assembly, and HTML stripping are done in pure Go.
+Single `main.go`, Go stdlib only (no dependencies). Most Gmail API calls go through `gws`. MIME message building, base64 encoding, multipart assembly, and HTML stripping are done in pure Go.
 
 ```
-gm ──→ gws (OAuth + Gmail API)
+gm ──→ gws (OAuth + Gmail API)            # default path
+ │
+ ├──→ Gmail media upload (net/http)       # large drafts only; reuses gws's refresh token
  │
  └──→ pandoc (markdown → HTML, only for --md)
 ```
+
+The large-message path reads gws's plaintext credentials from `$GWS_CONFIG_DIR`
+(default `~/.config/gws/`), refreshes an access token, and POSTs the RFC822 message
+to `…/upload/gmail/v1/users/me/drafts` as `message/rfc822` (with the OAuth client's
+`project_id` as the `x-goog-user-project` quota project). It works only where those
+credentials are stored in plaintext.
 
 ## License
 
