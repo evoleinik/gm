@@ -29,11 +29,11 @@ import (
 var gTimeout = 30 * time.Second
 
 const (
-	exitOK      = 0
-	exitUser    = 1
-	exitGWS     = 2
-	gwsBin      = "gws"
-	defaultMax  = 10
+	exitOK       = 0
+	exitUser     = 1
+	exitGWS      = 2
+	gwsBin       = "gws"
+	defaultMax   = 10
 	idLen        = 16
 	fromTruncLen = 24
 	subjTruncLen = 44
@@ -1126,9 +1126,15 @@ func cmdSend(args []string, jsonOut bool) int {
 	for i := 2; i < len(args); i++ {
 		switch args[i] {
 		case "--body":
-			i++; if i < len(args) { bodyText = args[i] }
+			i++
+			if i < len(args) {
+				bodyText = args[i]
+			}
 		case "--md":
-			i++; if i < len(args) { mdFile = args[i] }
+			i++
+			if i < len(args) {
+				mdFile = args[i]
+			}
 		case "--attach":
 			i++
 			if i >= len(args) || strings.HasPrefix(args[i], "--") {
@@ -1137,13 +1143,22 @@ func cmdSend(args []string, jsonOut bool) int {
 			}
 			attachments = append(attachments, args[i])
 		case "--cc":
-			i++; if i < len(args) { cc = args[i] }
+			i++
+			if i < len(args) {
+				cc = args[i]
+			}
 		case "--bcc":
-			i++; if i < len(args) { bcc = args[i] }
+			i++
+			if i < len(args) {
+				bcc = args[i]
+			}
 		case "--no-bcc":
 			bcc = ""
 		case "--reply":
-			i++; if i < len(args) { replyMsgID = args[i] }
+			i++
+			if i < len(args) {
+				replyMsgID = args[i]
+			}
 		case "--now":
 			fmt.Fprintln(os.Stderr, "--now is disabled. gm always saves as draft. Send from Gmail or: gm send --draft <id>")
 			return exitUser
@@ -1372,11 +1387,17 @@ func emitDraftResult(res draftResult, to, cc, bcc, subject string, atts []attach
 
 	// stderr = human hints.
 	summary := fmt.Sprintf("DRAFT saved for %s", to)
-	if cc != "" { summary += fmt.Sprintf(" cc:%s", cc) }
-	if bcc != "" { summary += fmt.Sprintf(" bcc:%s", bcc) }
+	if cc != "" {
+		summary += fmt.Sprintf(" cc:%s", cc)
+	}
+	if bcc != "" {
+		summary += fmt.Sprintf(" bcc:%s", bcc)
+	}
 	if len(atts) > 0 {
 		names := make([]string, len(atts))
-		for i, a := range atts { names[i] = a.name }
+		for i, a := range atts {
+			names[i] = a.name
+		}
 		summary += fmt.Sprintf(" [%s]", strings.Join(names, ", "))
 	}
 	fmt.Fprintf(os.Stderr, "%s: %s\n", yellow(summary), subject)
@@ -1522,7 +1543,9 @@ func resolveThread(msgID string) (threadID, inReplyTo, references string) {
 	}
 	var orig struct {
 		ThreadID string `json:"threadId"`
-		Payload  struct{ Headers []header `json:"headers"` } `json:"payload"`
+		Payload  struct {
+			Headers []header `json:"headers"`
+		} `json:"payload"`
 	}
 	if json.Unmarshal(out, &orig) != nil {
 		return
@@ -1588,10 +1611,10 @@ func buildBodies(bodyText, mdFile string) (plain, htmlContent string, err error)
 }
 
 // normalizeMD fixes common AI-generated markdown issues before pandoc:
-// 1. Insert blank line before list items that follow a non-blank, non-list line
-// 2. Insert blank line before headings that follow a non-blank line
-// 3. Insert blank line after standalone bold lines (**text**) followed by non-blank text
-//    (LLMs write "**Header**\nDescription" but pandoc merges them into one paragraph)
+//  1. Insert blank line before list items that follow a non-blank, non-list line
+//  2. Insert blank line before headings that follow a non-blank line
+//  3. Insert blank line after standalone bold lines (**text**) followed by non-blank text
+//     (LLMs write "**Header**\nDescription" but pandoc merges them into one paragraph)
 func normalizeMD(s string) string {
 	lines := strings.Split(s, "\n")
 	var out []string
@@ -1630,11 +1653,19 @@ func buildMIME(to, subject, cc, bcc, inReplyTo, references, plain, htmlContent s
 	// Headers
 	buf.WriteString("From: me\r\n")
 	buf.WriteString("To: " + to + "\r\n")
-	if cc != "" { buf.WriteString("Cc: " + cc + "\r\n") }
-	if bcc != "" { buf.WriteString("Bcc: " + bcc + "\r\n") }
+	if cc != "" {
+		buf.WriteString("Cc: " + cc + "\r\n")
+	}
+	if bcc != "" {
+		buf.WriteString("Bcc: " + bcc + "\r\n")
+	}
 	buf.WriteString("Subject: " + encodeSubject(subject) + "\r\n")
-	if inReplyTo != "" { buf.WriteString("In-Reply-To: " + inReplyTo + "\r\n") }
-	if references != "" { buf.WriteString("References: " + references + "\r\n") }
+	if inReplyTo != "" {
+		buf.WriteString("In-Reply-To: " + inReplyTo + "\r\n")
+	}
+	if references != "" {
+		buf.WriteString("References: " + references + "\r\n")
+	}
 	buf.WriteString("MIME-Version: 1.0\r\n")
 
 	if len(attachments) > 0 {
