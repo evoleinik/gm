@@ -61,3 +61,9 @@ Single `main.go`, stdlib only. Default path calls `gws gmail users messages/draf
 - `gws` binary — handles OAuth, API calls
 - `pandoc` — only for `--md` flag
 - Go 1.24+
+
+## Learnings
+
+| Topic | Notes |
+| --- | --- |
+| [Apple Mail](learnings/apple-mail.md) | Remote visual-check failures |
