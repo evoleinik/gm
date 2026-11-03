@@ -1102,7 +1102,11 @@ func cmdReply(id, body string, jsonOut bool) int {
 
 // --- send command (pure Go: MIME building + pandoc for markdown) ---
 
-const emailCSS = `body{font-family:-apple-system,system-ui,sans-serif;max-width:680px;margin:0 auto;padding:24px;color:#000;line-height:1.7;font-size:15px}h1{font-size:1.3em;font-weight:600;border-bottom:1px solid #e8e8e8;padding-bottom:6px}h2{font-size:1.1em;font-weight:600;margin-top:28px}h3{font-size:1em;color:#000}ul,ol{padding-left:24px}li{margin:4px 0}table{border-collapse:collapse;width:100%;font-size:14px}th,td{border:1px solid #e0e0e0;padding:6px 12px;text-align:left}th{background:#fafafa;font-weight:600}code{background:#f3f4f5;padding:1px 5px;border-radius:3px;font-size:.88em;color:#555}blockquote{border-left:3px solid #ddd;margin:8px 0;padding:2px 14px;color:#666}a{color:#4a7ccc;text-decoration:none}`
+// emailCSS sets no text colour and no solid page or box background, so the mail
+// reads in both light and dark mode. Greys are translucent so they work on
+// either canvas. Apple Mail in dark mode turns text white, and any pinned light
+// background then gives white on white.
+const emailCSS = `body{font-family:-apple-system,system-ui,sans-serif;max-width:680px;margin:0 auto;padding:24px;line-height:1.7;font-size:15px}h1{font-size:1.3em;font-weight:600;border-bottom:1px solid rgba(128,128,128,.3);padding-bottom:6px}h2{font-size:1.1em;font-weight:600;margin-top:28px}h3{font-size:1em}ul,ol{padding-left:24px}li{margin:4px 0}table{border-collapse:collapse;width:100%;font-size:14px}th,td{border:1px solid rgba(128,128,128,.3);padding:6px 12px;text-align:left}th{background:rgba(128,128,128,.1);font-weight:600}code{background:rgba(128,128,128,.15);padding:1px 5px;border-radius:3px;font-size:.88em}pre{overflow:auto}pre code{background:none;padding:0}blockquote{border-left:3px solid rgba(128,128,128,.4);margin:8px 0;padding:2px 14px;opacity:.8}a{color:#4a7ccc;text-decoration:none}img{max-width:100%;height:auto}`
 
 func cmdSend(args []string, jsonOut bool) int {
 	// gm send --draft <id>  →  send an existing draft
@@ -1595,14 +1599,17 @@ func buildBodies(bodyText, mdFile string) (plain, htmlContent string, err error)
 		}
 		plain = string(plainOut)
 
-		// pandoc → HTML with inline CSS
-		cmd = exec.Command("pandoc", tmpFile, "-f", "markdown", "-t", "html5", "--standalone",
-			"-V", "header-includes=<style>"+emailCSS+"</style>")
+		// pandoc → HTML fragment. Not --standalone: its template pins a light
+		// page background and dark text, which breaks dark mode.
+		cmd = exec.Command("pandoc", tmpFile, "-f", "markdown", "-t", "html5")
 		htmlOut, err := cmd.Output()
 		if err != nil {
 			return "", "", fmt.Errorf("pandoc html: %w", err)
 		}
-		htmlContent = string(htmlOut)
+		htmlContent = `<!DOCTYPE html><html><head><meta charset="utf-8">` +
+			`<meta name="color-scheme" content="light dark">` +
+			`<meta name="supported-color-schemes" content="light dark">` +
+			`<style>` + emailCSS + `</style></head><body>` + string(htmlOut) + `</body></html>`
 	} else {
 		plain = bodyText
 		htmlContent = "<html><body><pre>" + html.EscapeString(bodyText) + "</pre></body></html>"
