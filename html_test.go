@@ -57,3 +57,39 @@ func TestMarkdownHTMLDarkModeSafe(t *testing.T) {
 		}
 	}
 }
+
+// The --body HTML must read like a normal mail: proportional font, with the
+// author's paragraphs and line breaks kept. A <pre> wrapper made Gmail show
+// the whole body in monospace (2026-11-05).
+func TestPlainBodyHTMLProportional(t *testing.T) {
+	body := "Hi Ashish,\r\n\r\nLine one\r\nLine two\n\n\n" +
+		"See https://example.com/a?b=1&c=2. Or (https://x.io/p).\n\n" +
+		"<b>not bold</b> & stuff"
+	plain, out, err := buildBodies(body, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plain != body {
+		t.Errorf("plain part changed:\n%q", plain)
+	}
+	if regexp.MustCompile(`(?i)<pre\b`).MatchString(out) {
+		t.Errorf("html has <pre>:\n%s", out)
+	}
+	if regexp.MustCompile(`(?i)monospace|courier|consolas|menlo`).MatchString(out) {
+		t.Errorf("html sets a monospace font:\n%s", out)
+	}
+	for _, want := range []string{
+		"<p>Hi Ashish,</p>",
+		"<p>Line one<br>\nLine two</p>",
+		`<a href="https://example.com/a?b=1&amp;c=2">https://example.com/a?b=1&amp;c=2</a>.`,
+		`(<a href="https://x.io/p">https://x.io/p</a>).`,
+		"<p>&lt;b&gt;not bold&lt;/b&gt; &amp; stuff</p>",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("html missing %q:\n%s", want, out)
+		}
+	}
+	if n := strings.Count(out, "<p>"); n != 4 {
+		t.Errorf("want 4 paragraphs, got %d:\n%s", n, out)
+	}
+}

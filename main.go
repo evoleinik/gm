@@ -1612,9 +1612,58 @@ func buildBodies(bodyText, mdFile string) (plain, htmlContent string, err error)
 			`<style>` + emailCSS + `</style></head><body>` + string(htmlOut) + `</body></html>`
 	} else {
 		plain = bodyText
-		htmlContent = "<html><body><pre>" + html.EscapeString(bodyText) + "</pre></body></html>"
+		htmlContent = plainToHTML(bodyText)
 	}
 	return
+}
+
+var (
+	paraBreakRe = regexp.MustCompile(`\n[ \t]*\n\s*`)
+	bareURLRe   = regexp.MustCompile(`https?://[^\s<>"]+`)
+)
+
+// plainToHTML renders a --body text as HTML in the mail client's normal font.
+// Blank lines start a new paragraph, single newlines become <br>, and bare
+// http(s) URLs become links. No <pre>: Gmail shows that in monospace.
+func plainToHTML(s string) string {
+	s = strings.TrimSpace(strings.ReplaceAll(s, "\r\n", "\n"))
+	var b strings.Builder
+	b.WriteString("<html><body>")
+	for _, para := range paraBreakRe.Split(s, -1) {
+		lines := strings.Split(para, "\n")
+		for i, l := range lines {
+			lines[i] = linkify(l)
+		}
+		b.WriteString("<p>" + strings.Join(lines, "<br>\n") + "</p>\n")
+	}
+	b.WriteString("</body></html>")
+	return b.String()
+}
+
+// linkify escapes one line and wraps bare URLs in <a>. Trailing punctuation
+// and an unmatched closing paren stay outside the link.
+func linkify(line string) string {
+	var b strings.Builder
+	last := 0
+	for _, m := range bareURLRe.FindAllStringIndex(line, -1) {
+		u := line[m[0]:m[1]]
+		for {
+			t := strings.TrimRight(u, ".,;:!?'")
+			if strings.HasSuffix(t, ")") && strings.Count(t, "(") < strings.Count(t, ")") {
+				t = t[:len(t)-1]
+			}
+			if t == u {
+				break
+			}
+			u = t
+		}
+		b.WriteString(html.EscapeString(line[last:m[0]]))
+		e := html.EscapeString(u)
+		b.WriteString(`<a href="` + e + `">` + e + `</a>`)
+		last = m[0] + len(u)
+	}
+	b.WriteString(html.EscapeString(line[last:]))
+	return b.String()
 }
 
 // normalizeMD fixes common AI-generated markdown issues before pandoc:

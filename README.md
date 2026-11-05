@@ -76,7 +76,7 @@ gm reply <message-id> "message body"    # plain text, threads correctly
 ### Send
 
 ```bash
-# Plain text
+# Plain text (HTML part: paragraphs in the normal font, URLs linked)
 gm send to@email "Subject" --body "Hello"
 
 # Markdown (rendered to styled HTML)

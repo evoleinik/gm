@@ -20,7 +20,7 @@ gm send <to> <subject> [opts]     # formatted email (see below)
 ### gm send options
 
 ```bash
---body "text"       # plain text body
+--body "text"       # plain text body (HTML part: <p>/<br>, links, normal font)
 --md file.md        # markdown body (pandoc → styled HTML)
 --md -              # markdown from stdin
 --attach file       # attach file (repeatable)
@@ -47,6 +47,8 @@ cp gm ~/bin/gm   # PATH location on box (also ~/go/bin works)
 Single `main.go`, stdlib only. Default path calls `gws gmail users messages/drafts {list,get,create,send}` and parses responses. MIME building (multipart, base64, attachments) is pure Go. Markdown → HTML via pandoc.
 
 **Dark mode (`--md`):** pandoc renders a fragment, not `--standalone`. Its standalone template pins `html{color:#1a1a1a;background-color:#fdfdfd}`, and Apple Mail in dark mode then shows white text on white. `buildBodies` wraps the fragment in a minimal page with `<meta name="color-scheme" content="light dark">`. `emailCSS` sets no text colour and no solid background. Greys are translucent `rgba(128,128,128,…)` so they work on either canvas. `html_test.go` fails if a colour or background lands on `html`/`body` again.
+
+**Plain body (`--body`):** the text/plain part is the text as given. The text/html part comes from `plainToHTML`. Blank lines make `<p>` paragraphs, single newlines make `<br>`, and bare URLs become links. Never wrap it in `<pre>`, because Gmail then shows the whole mail in monospace. `TestPlainBodyHTMLProportional` fails on `<pre>` or a monospace font.
 
 **Large-attachment path (the `--attach` fix):** Gmail's draft body is passed to gws as a single `--json` argv string, but Linux caps one argv string at `MAX_ARG_STRLEN` (128 KB) — so a draft with a ~90 KB+ attachment makes `exec` fail with E2BIG (previously a silent exit 2). When the encoded body would exceed `maxArgvBody` (120 KB), `createDraft` escalates to `createDraftViaUpload`: it reads gws's plaintext `credentials.json` (`$GWS_CONFIG_DIR`, default `~/.config/gws/`), refreshes an access token, and POSTs the RFC822 message to `…/upload/gmail/v1/users/me/drafts?uploadType=multipart` as a `message/rfc822` media part. The OAuth client's own project has Gmail disabled by default, so the request sets `x-goog-user-project` to the `project_id` from `client_secret.json` (the quota project that has Gmail enabled). This path only works where credentials are plaintext (box, not the encrypted-cred machines). gws's own `--upload` is unusable here because it hardcodes `application/octet-stream`, which Gmail rejects for drafts.
 
