@@ -48,6 +48,20 @@ gm 20           # latest 20
 gm --json       # machine-readable
 ```
 
+### Personal account
+
+```bash
+gm --personal search "query"   # same commands, second Google account
+```
+
+`--personal` (anywhere on the line) runs every call through `gwsp` instead of `gws`.
+`gwsp` is a wrapper you provide: it takes the same arguments as `gws` and is signed in
+to a second Google account. Under `--personal` there is no default BCC, and the
+large-attachment upload path refuses, because it reads the default gws login.
+
+Every confirmation names the mailbox, taken from Gmail's `getProfile`. A search with no
+results names the mailbox it read and says how to try the other one.
+
 ### Read
 
 ```bash
@@ -105,7 +119,7 @@ to send). With `--json` it emits a structured object:
 ```json
 {"draftId":"r-123","messageId":"19ef...","threadId":"19ef...","to":"bob@x.com",
  "subject":"Report","url":"https://mail.google.com/...","attachments":[{"filename":"data.csv","size":2048}],
- "via":"gws","action":"drafted"}
+ "via":"gws","account":"me@example.com","action":"drafted"}
 ```
 
 Attachments of any size work. Small messages go through `gws`; messages too large

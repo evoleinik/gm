@@ -15,7 +15,14 @@ gm search "query" -n 20           # search with custom limit
 gm search "query" --full          # search with body preview (500 chars) + attachments
 gm reply <id> "message"           # plain text reply (threaded)
 gm send <to> <subject> [opts]     # formatted email (see below)
+gm --personal <any command>       # same, on the second account (runs gwsp, not gws)
 ```
+
+`--personal` may appear anywhere. It sets `gwsBin = "gwsp"`, drops the default BCC, and
+makes the large-attachment upload refuse (that path reads `~/.config/gws`, the work login).
+Human output names the mailbox from `getProfile`, and follow-up hints say `gm --personal`.
+`account_test.go` fails if any of this falls back to the work account. Keep personal
+addresses out of this repo. It is public.
 
 ### gm send options
 
@@ -33,7 +40,7 @@ gm send <to> <subject> [opts]     # formatted email (see below)
 All commands support `--json` for machine-readable output.
 
 `gm send` always saves a DRAFT (never auto-sends). On success it prints the draft id
-+ message id to stdout; `--json` emits `{"draftId","messageId","threadId","to","subject","url","attachments":[{"filename","size"}],"via","action"}`.
++ message id to stdout; `--json` emits `{"draftId","messageId","threadId","to","subject","url","attachments":[{"filename","size"}],"via","account","action"}`.
 
 ## Build
 

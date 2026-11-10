@@ -28,11 +28,101 @@ import (
 
 var gTimeout = 30 * time.Second
 
+// Account selection. By default gm reads evgeny@airshelf.ai through gws.
+// --personal sends every call through gwsp, a gws wrapper signed in to a second
+// (personal) Google account.
+var (
+	gwsBin      = "gws"
+	personal    = false
+	mailboxName string // getProfile answer, cached for one run
+)
+
+func usePersonal() {
+	personal = true
+	gwsBin = "gwsp"
+	mailboxName = ""
+}
+
+// gmCmd is the command to type for a follow-up on the same account.
+func gmCmd() string {
+	if personal {
+		return "gm --personal"
+	}
+	return "gm"
+}
+
+// defaultBCC copies work mail to the work inbox. Personal mail is not copied there.
+func defaultBCC() string {
+	if personal {
+		return ""
+	}
+	return "evgeny@airshelf.ai"
+}
+
+// loginFix is the re-login step for the account in use.
+func loginFix() string {
+	if personal {
+		return "the personal login lapses every 7 days; re-login steps are in ~/.claude/REFERENCE.md (Personal Gmail)"
+	}
+	return "gws auth login"
+}
+
+// mailbox names the account gm is using. It asks Gmail rather than trusting the
+// flag, because a wrapper can be signed in to the wrong account: gwsp answered as
+// the work account until 2026-10-29.
+func mailbox() string {
+	if mailboxName != "" {
+		return mailboxName
+	}
+	out, err := callGWS("gmail", "users", "getProfile", "--params", `{"userId":"me"}`)
+	var prof struct {
+		EmailAddress string `json:"emailAddress"`
+	}
+	switch {
+	case err == nil && json.Unmarshal(out, &prof) == nil && prof.EmailAddress != "":
+		mailboxName = prof.EmailAddress
+	case personal:
+		mailboxName = "the personal account"
+	default:
+		mailboxName = "the work account"
+	}
+	return mailboxName
+}
+
+// noResultsMsg names the mailbox that was searched and points at the other one.
+func noResultsMsg(query, box string) string {
+	other := "for personal mail, add --personal"
+	if personal {
+		other = "for work mail, drop --personal"
+	}
+	return fmt.Sprintf("no results for %q in %s. Try broader terms, or %s.", query, box, other)
+}
+
+// parseGlobalFlags strips flags that may appear anywhere in the command line.
+func parseGlobalFlags(args []string) (rest []string, jsonOut bool) {
+	rest = make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--json":
+			jsonOut = true
+		case args[i] == "--personal":
+			usePersonal()
+		case args[i] == "--timeout" && i+1 < len(args):
+			if d, err := time.ParseDuration(args[i+1]); err == nil {
+				gTimeout = d
+			}
+			i++
+		default:
+			rest = append(rest, args[i])
+		}
+	}
+	return rest, jsonOut
+}
+
 const (
 	exitOK       = 0
 	exitUser     = 1
 	exitGWS      = 2
-	gwsBin       = "gws"
 	defaultMax   = 10
 	idLen        = 16
 	fromTruncLen = 24
@@ -63,24 +153,7 @@ func yellow(s string) string { return c("\033[33m", s) }
 func green(s string) string  { return c("\033[32m", s) }
 
 func main() {
-	args := os.Args[1:]
-
-	// parse global flags
-	jsonOut := false
-	filtered := args[:0]
-	for i := 0; i < len(args); i++ {
-		if args[i] == "--json" {
-			jsonOut = true
-		} else if args[i] == "--timeout" && i+1 < len(args) {
-			if d, err := time.ParseDuration(args[i+1]); err == nil {
-				gTimeout = d
-			}
-			i++
-		} else {
-			filtered = append(filtered, args[i])
-		}
-	}
-	args = filtered
+	args, jsonOut := parseGlobalFlags(os.Args[1:])
 
 	if len(args) == 0 {
 		os.Exit(cmdInbox(defaultMax, jsonOut))
@@ -184,7 +257,7 @@ Send options:
   --md file.md          markdown body (rendered to HTML via pandoc)
   --attach file         attach a file (repeatable)
   --cc addr             CC recipients
-  --bcc addr            BCC recipients (default: evgeny@airshelf.ai)
+  --bcc addr            BCC recipients (default: evgeny@airshelf.ai, none with --personal)
   --no-bcc              disable default BCC
   --reply msgid         thread onto an existing message
 
@@ -195,6 +268,7 @@ Examples:
   echo "**hi**" | gm send bob@x.com "Hello" --md -
 
 Flags:
+  --personal          use the personal account (via gwsp); default is evgeny@airshelf.ai
   --json              machine-readable JSON output
   --timeout <dur>     gws call timeout (default 30s)
   --usage             show usage stats (last 30 days)
@@ -222,14 +296,14 @@ func callGWS(args ...string) ([]byte, error) {
 			stderr := stderrBuf.String()
 			stderr = filterStderr(stderr)
 			if strings.Contains(stderr, "401") || strings.Contains(strings.ToLower(stderr), "auth") || strings.Contains(strings.ToLower(stderr), "token") {
-				fmt.Fprintf(os.Stderr, "gws auth failed — run 'gws auth login' to re-authenticate. Do not retry.\n")
+				fmt.Fprintf(os.Stderr, "%s auth failed. Fix: %s. Do not retry.\n", gwsBin, loginFix())
 			} else if elapsed < 100*time.Millisecond {
 				// Instant failure = gws config/binary issue, not transient
-				fmt.Fprintf(os.Stderr, "gws failed instantly (exit %d) — likely config or credentials issue. Do not retry.\n", exitErr.ExitCode())
+				fmt.Fprintf(os.Stderr, "%s failed instantly (exit %d) — likely config or credentials issue. Do not retry.\n", gwsBin, exitErr.ExitCode())
 				if stderr != "" {
 					fmt.Fprintf(os.Stderr, "  detail: %s\n", strings.TrimSpace(stderr))
 				}
-				fmt.Fprintf(os.Stderr, "  fix: gws auth login\n")
+				fmt.Fprintf(os.Stderr, "  fix: %s\n", loginFix())
 			} else if stderr != "" {
 				fmt.Fprintf(os.Stderr, "gws error: %s\n", strings.TrimSpace(stderr))
 			} else {
@@ -481,7 +555,7 @@ func cmdSearch(query string, count int, full bool, jsonOut bool) int {
 	ms := time.Since(start).Milliseconds()
 	logUsage("search", err == nil, ms, len(entries), query)
 	if len(entries) == 0 {
-		fmt.Fprintf(os.Stderr, "no results for %q (searched inbox). Try broader terms.\n", query)
+		fmt.Fprintln(os.Stderr, noResultsMsg(query, mailbox()))
 		return exitOK
 	}
 	if jsonOut {
@@ -1096,7 +1170,7 @@ func cmdReply(id, body string, jsonOut bool) int {
 		ID string `json:"id"`
 	}
 	json.Unmarshal(sendOut, &sendResp)
-	fmt.Fprintf(os.Stderr, "%s reply sent (id: %s)\n", green("OK"), sendResp.ID)
+	fmt.Fprintf(os.Stderr, "%s reply sent from %s (id: %s)\n", green("OK"), mailbox(), sendResp.ID)
 	return exitOK
 }
 
@@ -1123,7 +1197,7 @@ func cmdSend(args []string, jsonOut bool) int {
 	bodyText := ""
 	mdFile := ""
 	cc := ""
-	bcc := "evgeny@airshelf.ai"
+	bcc := defaultBCC()
 	replyMsgID := ""
 	var attachments []string
 
@@ -1360,9 +1434,10 @@ func createDraftViaUpload(raw []byte, threadID string) (draftResult, error) {
 }
 
 func emitDraftResult(res draftResult, to, cc, bcc, subject string, atts []attachSpec, jsonOut bool) int {
+	box := mailbox()
 	gmailURL := ""
 	if res.MessageID != "" {
-		gmailURL = "https://mail.google.com/mail/u/0/#drafts?compose=" + res.MessageID
+		gmailURL = gmailBase(box) + "#drafts?compose=" + res.MessageID
 	}
 
 	if jsonOut {
@@ -1379,6 +1454,7 @@ func emitDraftResult(res draftResult, to, cc, bcc, subject string, atts []attach
 			"url":         gmailURL,
 			"attachments": attOut,
 			"via":         res.Via,
+			"account":     box,
 			"action":      "drafted",
 		}
 		enc := json.NewEncoder(os.Stdout)
@@ -1390,7 +1466,7 @@ func emitDraftResult(res draftResult, to, cc, bcc, subject string, atts []attach
 	fmt.Fprintf(os.Stdout, "draft %s message %s\n", res.DraftID, res.MessageID)
 
 	// stderr = human hints.
-	summary := fmt.Sprintf("DRAFT saved for %s", to)
+	summary := fmt.Sprintf("DRAFT saved in %s for %s", box, to)
 	if cc != "" {
 		summary += fmt.Sprintf(" cc:%s", cc)
 	}
@@ -1408,7 +1484,7 @@ func emitDraftResult(res draftResult, to, cc, bcc, subject string, atts []attach
 	if gmailURL != "" {
 		fmt.Fprintf(os.Stderr, "  Review: %s\n", gmailURL)
 	}
-	fmt.Fprintf(os.Stderr, "  Send:   gm send --draft %s\n", res.DraftID)
+	fmt.Fprintf(os.Stderr, "  Send:   %s send --draft %s\n", gmCmd(), res.DraftID)
 	return exitOK
 }
 
@@ -1431,6 +1507,9 @@ func gwsConfigDir() string {
 // loadOAuthCreds reads gws's plaintext credentials and the OAuth client's project_id
 // (used as the quota project for the Gmail API call).
 func loadOAuthCreds() (oauthCreds, string, error) {
+	if personal {
+		return oauthCreds{}, "", fmt.Errorf("gm --personal cannot send a message this large (attachments over about 90 KB). The direct upload path needs a plaintext login, and the personal login is encrypted (credentials.enc). Send it from the work account, or share a Drive link instead")
+	}
 	dir := gwsConfigDir()
 	credPath := filepath.Join(dir, "credentials.json")
 	raw, err := os.ReadFile(credPath)
@@ -1525,15 +1604,16 @@ func cmdSendDraft(draftID string, jsonOut bool) int {
 
 	if jsonOut {
 		result := map[string]interface{}{
-			"id":     resp.ID,
-			"action": "sent",
+			"id":      resp.ID,
+			"account": mailbox(),
+			"action":  "sent",
 		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.Encode(result)
 		return exitOK
 	}
 
-	fmt.Fprintf(os.Stderr, "%s Draft sent (id: %s)\n", green("OK"), resp.ID)
+	fmt.Fprintf(os.Stderr, "%s Draft sent from %s (id: %s)\n", green("OK"), mailbox(), resp.ID)
 	return exitOK
 }
 
@@ -1909,4 +1989,13 @@ func logUsage(cmd string, ok bool, ms int64, resultCount int, args ...string) {
 	line, _ := json.Marshal(entry)
 	f.Write(line)
 	f.WriteString("\n")
+}
+
+// gmailBase opens Gmail signed in as box, so a review link lands in the right
+// account even when the browser holds several. u/0 is the browser's first account.
+func gmailBase(box string) string {
+	if strings.Contains(box, "@") {
+		return "https://mail.google.com/mail/u/" + box + "/"
+	}
+	return "https://mail.google.com/mail/u/0/"
 }
