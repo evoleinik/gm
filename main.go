@@ -59,10 +59,12 @@ func defaultBCC() string {
 	return "evgeny@airshelf.ai"
 }
 
-// loginFix is the re-login step for the account in use.
+// loginFix is the re-login step for the account in use. The personal OAuth app is
+// in Testing mode, so its login lapses every 7 days. `gwsp relogin` starts the
+// sign-in and prints how to finish it.
 func loginFix() string {
 	if personal {
-		return "the personal login lapses every 7 days; re-login steps are in ~/.claude/REFERENCE.md (Personal Gmail)"
+		return "gwsp relogin"
 	}
 	return "gws auth login"
 }
@@ -123,6 +125,7 @@ const (
 	exitOK       = 0
 	exitUser     = 1
 	exitGWS      = 2
+	exitAuth     = 3 // login expired or revoked: re-login first, a retry cannot help
 	defaultMax   = 10
 	idLen        = 16
 	fromTruncLen = 24
@@ -293,19 +296,21 @@ func callGWS(args ...string) ([]byte, error) {
 	if err != nil {
 		elapsed := time.Since(start)
 		if exitErr, ok := err.(*exec.ExitError); ok {
-			stderr := stderrBuf.String()
-			stderr = filterStderr(stderr)
-			if strings.Contains(stderr, "401") || strings.Contains(strings.ToLower(stderr), "auth") || strings.Contains(strings.ToLower(stderr), "token") {
-				fmt.Fprintf(os.Stderr, "%s auth failed. Fix: %s. Do not retry.\n", gwsBin, loginFix())
+			detail, auth := gwsFailure(out, stderrBuf.String())
+			if auth {
+				authExit.Do(func() {
+					fmt.Fprintln(os.Stderr, authFailedMsg(detail))
+					os.Exit(exitAuth)
+				})
 			} else if elapsed < 100*time.Millisecond {
 				// Instant failure = gws config/binary issue, not transient
 				fmt.Fprintf(os.Stderr, "%s failed instantly (exit %d) — likely config or credentials issue. Do not retry.\n", gwsBin, exitErr.ExitCode())
-				if stderr != "" {
-					fmt.Fprintf(os.Stderr, "  detail: %s\n", strings.TrimSpace(stderr))
+				if detail != "" {
+					fmt.Fprintf(os.Stderr, "  detail: %s\n", detail)
 				}
 				fmt.Fprintf(os.Stderr, "  fix: %s\n", loginFix())
-			} else if stderr != "" {
-				fmt.Fprintf(os.Stderr, "gws error: %s\n", strings.TrimSpace(stderr))
+			} else if detail != "" {
+				fmt.Fprintf(os.Stderr, "gws error: %s\n", detail)
 			} else {
 				fmt.Fprintf(os.Stderr, "gws error: exit %d\n", exitErr.ExitCode())
 			}
@@ -321,6 +326,48 @@ func callGWS(args ...string) ([]byte, error) {
 		return nil, err
 	}
 	return out, nil
+}
+
+// authExit makes parallel calls (batch read) print the login message once.
+var authExit sync.Once
+
+// gwsFailure turns a failed gws call into one line of detail and says whether
+// it is a login failure. gws prints API errors as JSON on stdout, and stderr
+// holds only "Using keyring backend". Reading stderr alone printed a bare
+// "gws error: exit 1" when the personal login expired (2026-11-13).
+func gwsFailure(stdout []byte, stderr string) (detail string, auth bool) {
+	var e struct {
+		Error struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+			Reason  string `json:"reason"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(stdout, &e) == nil && e.Error.Message != "" {
+		detail = e.Error.Message
+		if e.Error.Code != 0 {
+			detail = fmt.Sprintf("%d %s", e.Error.Code, detail)
+		}
+		auth = e.Error.Code == 401 || e.Error.Reason == "authError"
+	} else if detail = filterStderr(stderr); detail == "" {
+		detail = strings.TrimSpace(string(stdout))
+	}
+	detail = strings.Join(strings.Fields(detail), " ")
+	if len(detail) > 300 {
+		detail = detail[:300] + "…"
+	}
+	low := strings.ToLower(detail)
+	for _, w := range []string{"401", "auth", "invalid_grant", "expired or revoked", "credential"} {
+		if strings.Contains(low, w) {
+			auth = true
+		}
+	}
+	return detail, auth
+}
+
+// authFailedMsg names the account, the real gws error, and the one fix.
+func authFailedMsg(detail string) string {
+	return fmt.Sprintf("%s: login expired or revoked (%s). Fix: run `%s`, then retry. Retrying first will fail the same way.", gmCmd(), detail, loginFix())
 }
 
 func filterStderr(s string) string {

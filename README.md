@@ -58,6 +58,8 @@ gm --personal search "query"   # same commands, second Google account
 `gwsp` is a wrapper you provide: it takes the same arguments as `gws` and is signed in
 to a second Google account. Under `--personal` there is no default BCC, and the
 large-attachment upload path refuses, because it reads the default gws login.
+When the personal login lapses, gm exits 3 and tells you to run `gwsp relogin`, so the
+wrapper should also answer that verb by starting a sign-in for its account.
 
 Every confirmation names the mailbox, taken from Gmail's `getProfile`. A search with no
 results names the mailbox it read and says how to try the other one.
@@ -133,7 +135,8 @@ stored OAuth token. `via` reports which path was used.
 |------|---------|
 | 0 | Success |
 | 1 | User error (bad arguments) |
-| 2 | gws error (auth, network, API) |
+| 2 | gws error (network, API). The message carries gws's own error text |
+| 3 | Login expired or revoked. The message names the re-login command (`gws auth login`, or `gwsp relogin` under `--personal`). A retry before that fails the same way |
 
 ## Architecture
 

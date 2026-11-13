@@ -63,7 +63,13 @@ Single `main.go`, stdlib only. Default path calls `gws gmail users messages/draf
 
 - 0: success
 - 1: user error (bad args)
-- 2: gws error (auth, network, etc.)
+- 2: gws error (network, API, etc.)
+- 3: login expired or revoked. Prints the fix command and exits at the first failed call
+
+**gws errors arrive on stdout.** gws prints an API error as JSON (`{"error":{"code","message","reason"}}`)
+on stdout, and stderr holds only "Using keyring backend". `gwsFailure` reads both. Reading stderr
+alone printed a bare `gws error: exit 1` for an expired personal login (2026-11-13).
+`TestPersonalExpiredLoginEndToEnd` runs main() against a stub `gwsp` and fails if that returns.
 
 ## Dependencies
 
